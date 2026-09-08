@@ -4,11 +4,9 @@ const PORT = process.env.PORT || 3000;
 const ADZUNA_APP_ID = process.env.ADZUNA_APP_ID;
 const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
 const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
+const cache = new Map();
 
-const GEO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const geoCache = new Map();
-
-function sendJson(res, status, data) {
+function send(res, status, data) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*"
@@ -16,28 +14,21 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function validCoordinate(lat, lon) {
-  return Number.isFinite(lat) && Number.isFinite(lon) &&
-    lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 &&
-    !(Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001);
+function street(s = "") {
+  return /\d/.test(s) &&
+    /\b(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|suite|ste)\b/i.test(s);
 }
 
-function looksLikeStreetAddress(text) {
-  const x = String(text || "").toLowerCase();
-  return /\d/.test(x) &&
-    /\b(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|suite|ste)\b/.test(x);
+function genericCompany(s = "") {
+  s = s.trim().toLowerCase();
+  return !s ||
+    ["unknown company", "employer", "confidential", "company"].includes(s) ||
+    s.includes("confidential employer") ||
+    s.includes("undisclosed");
 }
 
-function isGenericCompanyName(name) {
-  const x = String(name || "").trim().toLowerCase();
-  return !x || x === "unknown company" || x === "employer" ||
-    x === "confidential" || x === "company" ||
-    x.includes("confidential employer") || x.includes("undisclosed");
-}
-
-function normalizeName(value) {
-  return String(value || "")
-    .toLowerCase()
+function norm(s = "") {
+  return s.toLowerCase()
     .replace(/&/g, " and ")
     .replace(/[^a-z0-9 ]+/g, " ")
     .replace(/\b(inc|llc|corp|corporation|company|co|ltd|the)\b/g, " ")
@@ -45,101 +36,180 @@ function normalizeName(value) {
     .trim();
 }
 
-function nameScore(company, result) {
-  const want = normalizeName(company);
-  const got = normalizeName(result?.name || result?.formatted || "");
+function nameScore(company, r) {
+  const a = norm(company);
+  const b = norm(r.name || r.formatted || "");
 
-  if (!want || !got) return 0;
-  if (got === want) return 100;
-  if (got.includes(want) || want.includes(got)) return 85;
+  if (!a || !b) return 0;
+  if (a === b) return 100;
+  if (a.includes(b) || b.includes(a)) return 85;
 
-  const a = new Set(want.split(" ").filter(Boolean));
-  const b = new Set(got.split(" ").filter(Boolean));
+  const A = new Set(a.split(" ").filter(Boolean));
+  const B = new Set(b.split(" ").filter(Boolean));
 
-  let overlap = 0;
-  for (const token of a) {
-    if (b.has(token)) overlap++;
+  let hit = 0;
+  for (const t of A) {
+    if (B.has(t)) hit++;
   }
 
-  return a.size ? Math.round((overlap / a.size) * 70) : 0;
+  return A.size ? Math.round(hit / A.size * 70) : 0;
 }
 
-function milesBetween(lat1, lon1, lat2, lon2) {
-  const R = 3958.761;
+function miles(a, b, c, d) {
   const p = Math.PI / 180;
-  const dLat = (lat2 - lat1) * p;
-  const dLon = (lon2 - lon1) * p;
+  const R = 3958.761;
+  const x = (c - a) * p;
+  const y = (d - b) * p;
 
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1 * p) *
-    Math.cos(lat2 * p) *
-    Math.sin(dLon / 2) ** 2;
+  const z =
+    Math.sin(x / 2) ** 2 +
+    Math.cos(a * p) *
+    Math.cos(c * p) *
+    Math.sin(y / 2) ** 2;
 
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * 2 * Math.atan2(Math.sqrt(z), Math.sqrt(1 - z));
 }
 
-async function geoapifyLikelyWorkplace(job) {
+async function geo(job) {
   if (
     !GEOAPIFY_API_KEY ||
-    !job ||
-    looksLikeStreetAddress(job.location) ||
-    isGenericCompanyName(job.company)
+    street(job.location) ||
+    genericCompany(job.company)
   ) {
     return null;
   }
 
-  const cacheKey =
-    `${normalizeName(job.company)}|${String(job.location || "")
-      .toLowerCase()
-      .trim()}`;
+  const key =
+    `${norm(job.company)}|${job.location.toLowerCase().trim()}`;
 
-  const cached = geoCache.get(cacheKey);
+  const old = cache.get(key);
 
-  if (
-    cached &&
-    Date.now() - cached.time < GEO_CACHE_TTL_MS
-  ) {
-    return cached.value;
+  if (old && Date.now() - old.t < 604800000) {
+    return old.v;
   }
 
-  const url =
+  const u =
     new URL("https://api.geoapify.com/v1/geocode/search");
 
-  url.searchParams.set(
+  u.searchParams.set(
     "text",
     `${job.company}, ${job.location}`
   );
 
-  url.searchParams.set("type", "amenity");
-  url.searchParams.set("filter", "countrycode:us");
-  url.searchParams.set("format", "json");
-  url.searchParams.set("limit", "5");
-  url.searchParams.set("lang", "en");
-  url.searchParams.set("apiKey", GEOAPIFY_API_KEY);
+  u.searchParams.set("filter", "countrycode:us");
+  u.searchParams.set("format", "json");
+  u.searchParams.set("limit", "5");
+  u.searchParams.set("apiKey", GEOAPIFY_API_KEY);
 
-  if (validCoordinate(job.latitude, job.longitude)) {
-    url.searchParams.set(
+  if (
+    Number.isFinite(job.latitude) &&
+    Number.isFinite(job.longitude)
+  ) {
+    u.searchParams.set(
       "bias",
       `proximity:${job.longitude},${job.latitude}`
     );
   }
 
   try {
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(7000)
-    });
+    const r = await fetch(u);
 
-    if (!response.ok) {
-      throw new Error(`Geoapify HTTP ${response.status}`);
+    if (!r.ok) {
+      throw new Error(`Geoapify HTTP ${r.status}`);
     }
 
-    const data = await response.json();
-
-    const results =
-      Array.isArray(data.results) ? data.results : [];
+    const data = await r.json();
 
     let best = null;
-    let bestScore = -1;
+    let score = -1;
 
-    for (
+    for (const x of data.results || []) {
+      const lat = Number(x.lat);
+      const lon = Number(x.lon);
+
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lon)
+      ) continue;
+
+      let s = nameScore(job.company, x);
+
+      if (
+        Number.isFinite(job.latitude) &&
+        Number.isFinite(job.longitude)
+      ) {
+        const d = miles(
+          job.latitude,
+          job.longitude,
+          lat,
+          lon
+        );
+
+        if (d > 30) continue;
+
+        s +=
+          d <= 3 ? 20 :
+          d <= 10 ? 12 :
+          d <= 20 ? 5 : 0;
+      }
+
+      if (Number(x.rank?.confidence) >= 0.8) {
+        s += 8;
+      }
+
+      if (s > score) {
+        score = s;
+        best = x;
+      }
+    }
+
+    const v =
+      best && score >= 70
+        ? {
+            latitude: +best.lat,
+            longitude: +best.lon,
+            address:
+              best.formatted ||
+              job.location,
+            score
+          }
+        : null;
+
+    cache.set(key, {
+      t: Date.now(),
+      v
+    });
+
+    return v;
+
+  } catch (e) {
+    console.warn(
+      "Geoapify lookup failed:",
+      e.message
+    );
+
+    return null;
+  }
+}
+
+async function searchAdzuna(p) {
+  if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) {
+    throw new Error(
+      "Adzuna credentials are not configured"
+    );
+  }
+
+  const page =
+    Math.max(1, +p.get("page") || 1);
+
+  const u =
+    new URL(
+      `https://api.adzuna.com/v1/api/jobs/us/search/${page}`
+    );
+
+  u.searchParams.set(
+    "app_id",
+    ADZUNA_APP_ID
+  );
+
+  u.search
