@@ -17,22 +17,40 @@ function sendJson(res, status, data) {
 }
 
 function validCoordinate(lat, lon) {
-  return Number.isFinite(lat) && Number.isFinite(lon) &&
-    lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 &&
-    !(Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001);
+  return (
+    Number.isFinite(lat) &&
+    Number.isFinite(lon) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180 &&
+    !(Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001)
+  );
 }
 
 function looksLikeStreetAddress(text) {
   const x = String(text || "").toLowerCase();
-  return /\d/.test(x) && /\b(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|suite|ste)\b/.test(x);
+
+  return (
+    /\d/.test(x) &&
+    /\b(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|suite|ste)\b/.test(x)
+  );
 }
 
 function isGenericCompanyName(name) {
-  const x = String(name || "").trim().toLowerCase();
-  return !x || x === "unknown company" || x === "employer" ||
-    x === "confidential" || x === "company" ||
+  const x = String(name || "")
+    .trim()
+    .toLowerCase();
+
+  return (
+    !x ||
+    x === "unknown company" ||
+    x === "employer" ||
+    x === "confidential" ||
+    x === "company" ||
     x.includes("confidential employer") ||
-    x.includes("undisclosed");
+    x.includes("undisclosed")
+  );
 }
 
 function normalizeName(value) {
@@ -40,33 +58,61 @@ function normalizeName(value) {
     .toLowerCase()
     .replace(/&/g, " and ")
     .replace(/[^a-z0-9 ]+/g, " ")
-    .replace(/\b(inc|llc|corp|corporation|company|co|ltd|the)\b/g, " ")
+    .replace(
+      /\b(inc|llc|corp|corporation|company|co|ltd|the)\b/g,
+      " "
+    )
     .replace(/\s+/g, " ")
     .trim();
 }
 
 function nameScore(company, result) {
   const want = normalizeName(company);
-  const got = normalizeName(result?.name || result?.formatted || "");
+
+  const got = normalizeName(
+    result?.name ||
+    result?.formatted ||
+    ""
+  );
 
   if (!want || !got) return 0;
-  if (got === want) return 100;
-  if (got.includes(want) || want.includes(got)) return 85;
 
-  const a = new Set(want.split(" ").filter(Boolean));
-  const b = new Set(got.split(" ").filter(Boolean));
-
-  let overlap = 0;
-  for (const token of a) {
-    if (b.has(token)) overlap++;
+  if (got === want) {
+    return 100;
   }
 
-  return a.size ? Math.round((overlap / a.size) * 70) : 0;
+  if (
+    got.includes(want) ||
+    want.includes(got)
+  ) {
+    return 85;
+  }
+
+  const a = new Set(
+    want.split(" ").filter(Boolean)
+  );
+
+  const b = new Set(
+    got.split(" ").filter(Boolean)
+  );
+
+  let overlap = 0;
+
+  for (const token of a) {
+    if (b.has(token)) {
+      overlap++;
+    }
+  }
+
+  return a.size
+    ? Math.round((overlap / a.size) * 70)
+    : 0;
 }
 
 function milesBetween(lat1, lon1, lat2, lon2) {
   const R = 3958.761;
   const p = Math.PI / 180;
+
   const dLat = (lat2 - lat1) * p;
   const dLon = (lon2 - lon1) * p;
 
@@ -76,10 +122,21 @@ function milesBetween(lat1, lon1, lat2, lon2) {
       Math.cos(lat2 * p) *
       Math.sin(dLon / 2) ** 2;
 
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return (
+    R *
+    2 *
+    Math.atan2(
+      Math.sqrt(a),
+      Math.sqrt(1 - a)
+    )
+  );
 }
 
-async function geoapifySearchOrigin(where, fallbackLat, fallbackLon) {
+async function geoapifySearchOrigin(
+  where,
+  fallbackLat,
+  fallbackLon
+) {
   if (validCoordinate(fallbackLat, fallbackLon)) {
     return {
       latitude: fallbackLat,
@@ -88,32 +145,54 @@ async function geoapifySearchOrigin(where, fallbackLat, fallbackLon) {
     };
   }
 
-  if (!GEOAPIFY_API_KEY || !String(where || "").trim()) {
+  if (
+    !GEOAPIFY_API_KEY ||
+    !String(where || "").trim()
+  ) {
     return null;
   }
 
-  const url = new URL("https://api.geoapify.com/v1/geocode/search");
+  const url = new URL(
+    "https://api.geoapify.com/v1/geocode/search"
+  );
 
-  url.searchParams.set("text", String(where).trim());
-  url.searchParams.set("filter", "countrycode:us");
+  url.searchParams.set(
+    "text",
+    String(where).trim()
+  );
+
+  url.searchParams.set(
+    "filter",
+    "countrycode:us"
+  );
+
   url.searchParams.set("format", "json");
   url.searchParams.set("limit", "1");
   url.searchParams.set("lang", "en");
-  url.searchParams.set("apiKey", GEOAPIFY_API_KEY);
+  url.searchParams.set(
+    "apiKey",
+    GEOAPIFY_API_KEY
+  );
 
   const response = await fetch(url, {
     signal: AbortSignal.timeout(7000)
   });
 
   if (!response.ok) {
-    throw new Error(`Geoapify origin HTTP ${response.status}`);
+    throw new Error(
+      `Geoapify origin HTTP ${response.status}`
+    );
   }
 
   const data = await response.json();
-  const r = Array.isArray(data.results) ? data.results[0] : null;
 
-  const lat = Number(r?.lat);
-  const lon = Number(r?.lon);
+  const result =
+    Array.isArray(data.results)
+      ? data.results[0]
+      : null;
+
+  const lat = Number(result?.lat);
+  const lon = Number(result?.lon);
 
   if (!validCoordinate(lat, lon)) {
     return null;
@@ -122,11 +201,11 @@ async function geoapifySearchOrigin(where, fallbackLat, fallbackLon) {
   return {
     latitude: lat,
     longitude: lon,
-    label: r.formatted || String(where).trim()
+    label:
+      result.formatted ||
+      String(where).trim()
   };
-}
-
-async function geoapifyLikelyWorkplace(job) {
+}async function geoapifyLikelyWorkplace(job) {
   if (
     !GEOAPIFY_API_KEY ||
     !job ||
@@ -138,7 +217,9 @@ async function geoapifyLikelyWorkplace(job) {
 
   const cacheKey =
     `${normalizeName(job.company)}|` +
-    `${String(job.location || "").toLowerCase().trim()}`;
+    `${String(job.location || "")
+      .toLowerCase()
+      .trim()}`;
 
   const cached = geoCache.get(cacheKey);
 
@@ -158,8 +239,17 @@ async function geoapifyLikelyWorkplace(job) {
     `${job.company}, ${job.location}`
   );
 
-  url.searchParams.set("type", "amenity");
-  url.searchParams.set("filter", "countrycode:us");  if (validCoordinate(job.latitude, job.longitude)) {
+  url.searchParams.set(
+    "filter",
+    "countrycode:us"
+  );
+
+  if (
+    validCoordinate(
+      job.latitude,
+      job.longitude
+    )
+  ) {
     url.searchParams.set(
       "bias",
       `proximity:${job.longitude},${job.latitude}`
@@ -169,7 +259,11 @@ async function geoapifyLikelyWorkplace(job) {
   url.searchParams.set("format", "json");
   url.searchParams.set("limit", "5");
   url.searchParams.set("lang", "en");
-  url.searchParams.set("apiKey", GEOAPIFY_API_KEY);
+
+  url.searchParams.set(
+    "apiKey",
+    GEOAPIFY_API_KEY
+  );
 
   try {
     const response = await fetch(url, {
@@ -177,13 +271,17 @@ async function geoapifyLikelyWorkplace(job) {
     });
 
     if (!response.ok) {
-      throw new Error(`Geoapify workplace HTTP ${response.status}`);
+      throw new Error(
+        `Geoapify workplace HTTP ${response.status}`
+      );
     }
 
     const data = await response.json();
-    const results = Array.isArray(data.results)
-      ? data.results
-      : [];
+
+    const results =
+      Array.isArray(data.results)
+        ? data.results
+        : [];
 
     let best = null;
     let bestScore = 0;
@@ -196,7 +294,10 @@ async function geoapifyLikelyWorkplace(job) {
         continue;
       }
 
-      const score = nameScore(job.company, result);
+      const score = nameScore(
+        job.company,
+        result
+      );
 
       if (score > bestScore) {
         bestScore = score;
@@ -216,10 +317,12 @@ async function geoapifyLikelyWorkplace(job) {
     const match = {
       latitude: Number(best.lat),
       longitude: Number(best.lon),
+
       location:
         best.formatted ||
         best.address_line2 ||
         job.location,
+
       score: bestScore
     };
 
@@ -243,29 +346,48 @@ function normalizeAdzunaJob(item) {
   const lat = Number(item.latitude);
   const lon = Number(item.longitude);
 
+  const providerLocation =
+    item.location?.display_name || "";
+
+  const exact =
+    looksLikeStreetAddress(
+      providerLocation
+    );
+
   return {
     id: String(item.id || ""),
+
     source: "Adzuna",
-    title: item.title || "Untitled job",
+
+    title:
+      item.title ||
+      "Untitled job",
+
     company:
       item.company?.display_name ||
       "Unknown company",
 
-    latitude: validCoordinate(lat, lon)
-      ? lat
-      : null,
+    latitude:
+      validCoordinate(lat, lon)
+        ? lat
+        : null,
 
-    longitude: validCoordinate(lat, lon)
-      ? lon
-      : null,
+    longitude:
+      validCoordinate(lat, lon)
+        ? lon
+        : null,
 
     salary_min:
-      Number.isFinite(Number(item.salary_min))
+      Number.isFinite(
+        Number(item.salary_min)
+      )
         ? Number(item.salary_min)
         : null,
 
     salary_max:
-      Number.isFinite(Number(item.salary_max))
+      Number.isFinite(
+        Number(item.salary_max)
+      )
         ? Number(item.salary_max)
         : null,
 
@@ -275,7 +397,7 @@ function normalizeAdzunaJob(item) {
       item.category?.label || "",
 
     location:
-      item.location?.display_name || "",
+      providerLocation,
 
     description:
       item.description || "",
@@ -287,18 +409,15 @@ function normalizeAdzunaJob(item) {
       item.created || "",
 
     location_precision:
-      looksLikeStreetAddress(
-        item.location?.display_name
-      )
+      exact
         ? "exact"
         : "area",
 
     location_approximate:
-      !looksLikeStreetAddress(
-        item.location?.display_name
-      ),
+      !exact,
 
-    location_match_provider: null
+    location_match_provider:
+      null
   };
 }
 
@@ -307,9 +426,17 @@ async function enrichJobLocation(job) {
     return job;
   }
 
-  if (looksLikeStreetAddress(job.location)) {
-    job.location_precision = "exact";
-    job.location_approximate = false;
+  if (
+    looksLikeStreetAddress(
+      job.location
+    )
+  ) {
+    job.location_precision =
+      "exact";
+
+    job.location_approximate =
+      false;
+
     return job;
   }
 
@@ -317,27 +444,43 @@ async function enrichJobLocation(job) {
     await geoapifyLikelyWorkplace(job);
 
   if (!match) {
-    job.location_precision = "area";
-    job.location_approximate = true;
+    job.location_precision =
+      "area";
+
+    job.location_approximate =
+      true;
+
     return job;
   }
 
-  job.latitude = match.latitude;
-  job.longitude = match.longitude;
-  job.location = match.location;
-  job.location_precision = "likely";
-  job.location_approximate = true;
-  job.location_match_provider = "Geoapify";
+  job.latitude =
+    match.latitude;
+
+  job.longitude =
+    match.longitude;
+
+  job.location =
+    match.location;
+
+  job.location_precision =
+    "likely";
+
+  job.location_approximate =
+    true;
+
+  job.location_match_provider =
+    "Geoapify";
 
   return job;
-}
-
-async function fetchAdzunaJobs(
+}async function fetchAdzunaJobs(
   where,
   radius,
   query
 ) {
-  if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) {
+  if (
+    !ADZUNA_APP_ID ||
+    !ADZUNA_APP_KEY
+  ) {
     throw new Error(
       "Adzuna environment variables are missing"
     );
@@ -363,17 +506,28 @@ async function fetchAdzunaJobs(
   );
 
   if (where) {
-    url.searchParams.set("where", where);
+    url.searchParams.set(
+      "where",
+      where
+    );
   }
 
   if (query) {
-    url.searchParams.set("what", query);
+    url.searchParams.set(
+      "what",
+      query
+    );
   }
 
   if (radius > 0) {
     url.searchParams.set(
       "distance",
-      String(Math.min(radius, 100))
+      String(
+        Math.min(
+          radius,
+          100
+        )
+      )
     );
   }
 
@@ -382,12 +536,19 @@ async function fetchAdzunaJobs(
     "application/json"
   );
 
-  const response = await fetch(url, {
-    signal: AbortSignal.timeout(15000)
-  });
+  const response = await fetch(
+    url,
+    {
+      signal:
+        AbortSignal.timeout(
+          15000
+        )
+    }
+  );
 
   if (!response.ok) {
-    const body = await response.text();
+    const body =
+      await response.text();
 
     throw new Error(
       `Adzuna HTTP ${response.status}: ` +
@@ -395,39 +556,341 @@ async function fetchAdzunaJobs(
     );
   }
 
-  const data = await response.json();
+  const data =
+    await response.json();
 
-  return Array.isArray(data.results)
+  return Array.isArray(
+    data.results
+  )
     ? data.results
     : [];
-}async function handleJobs(req, res, url) {
+}
+
+async function handleJobs(
+  req,
+  res,
+  url
+) {
   try {
     const where =
-      String(url.searchParams.get("where") || "").trim();
+      String(
+        url.searchParams.get(
+          "where"
+        ) || ""
+      ).trim();
 
     const query =
       String(
-        url.searchParams.get("what") ||
-        url.searchParams.get("query") ||
+        url.searchParams.get(
+          "what"
+        ) ||
+        url.searchParams.get(
+          "query"
+        ) ||
         ""
       ).trim();
 
     const requestedRadius =
-      Number(url.searchParams.get("radius") || 25);
+      Number(
+        url.searchParams.get(
+          "radius"
+        ) || 25
+      );
 
     const radius =
-      Number.isFinite(requestedRadius) &&
+      Number.isFinite(
+        requestedRadius
+      ) &&
       requestedRadius > 0
-        ? Math.min(requestedRadius, 100)
+        ? Math.min(
+            requestedRadius,
+            100
+          )
         : 25;
 
     const centerLat =
-      Number(url.searchParams.get("lat"));
+      Number(
+        url.searchParams.get(
+          "lat"
+        )
+      );
 
     const centerLon =
-      Number(url.searchParams.get("lon"));
+      Number(
+        url.searchParams.get(
+          "lon"
+        )
+      );
 
     const origin =
       await geoapifySearchOrigin(
         where,
-        centerLat
+        centerLat,
+        centerLon
+      );
+
+    if (!origin) {
+      return sendJson(
+        res,
+        400,
+        {
+          error:
+            "Could not resolve the requested search location."
+        }
+      );
+    }
+
+    const rawJobs =
+      await fetchAdzunaJobs(
+        where,
+        radius,
+        query
+      );
+
+    const normalized =
+      rawJobs.map(
+        normalizeAdzunaJob
+      );
+
+    const enrichmentBatchSize = 8;
+    const enriched = [];
+
+    for (
+      let i = 0;
+      i < normalized.length;
+      i += enrichmentBatchSize
+    ) {
+      const batch =
+        normalized.slice(
+          i,
+          i +
+            enrichmentBatchSize
+        );
+
+      const results =
+        await Promise.all(
+          batch.map(
+            async (job) => {
+              const updated =
+                await enrichJobLocation(
+                  job
+                );
+
+              if (
+                !validCoordinate(
+                  updated.latitude,
+                  updated.longitude
+                )
+              ) {
+                return null;
+              }
+
+              const distance =
+                milesBetween(
+                  origin.latitude,
+                  origin.longitude,
+                  updated.latitude,
+                  updated.longitude
+                );
+
+              if (
+                distance >
+                radius
+              ) {
+                return null;
+              }
+
+              updated.distance_miles =
+                Math.round(
+                  distance * 10
+                ) / 10;
+
+              return updated;
+            }
+          )
+        );
+
+      for (
+        const job of results
+      ) {
+        if (job) {
+          enriched.push(job);
+        }
+      }
+    }
+
+    enriched.sort(
+      (a, b) =>
+        Number(
+          a.distance_miles ||
+            0
+        ) -
+        Number(
+          b.distance_miles ||
+            0
+        )
+    );
+
+    return sendJson(
+      res,
+      200,
+      {
+        count:
+          enriched.length,
+
+        search_location:
+          origin.label,
+
+        search_latitude:
+          origin.latitude,
+
+        search_longitude:
+          origin.longitude,
+
+        radius_miles:
+          radius,
+
+        jobs:
+          enriched
+      }
+    );
+  } catch (error) {
+    console.error(
+      "Jobs request failed:",
+      error
+    );
+
+    return sendJson(
+      res,
+      500,
+      {
+        error:
+          "Unable to load live jobs right now.",
+
+        details:
+          error.message
+      }
+    );
+  }
+}const server =
+  http.createServer(
+    async (req, res) => {
+      try {
+        const url =
+          new URL(
+            req.url,
+            `http://${req.headers.host || "localhost"}`
+          );
+
+        if (req.method === "OPTIONS") {
+          res.writeHead(
+            204,
+            {
+              "Access-Control-Allow-Origin": "*",
+              "Access-Control-Allow-Methods":
+                "GET,OPTIONS",
+              "Access-Control-Allow-Headers":
+                "Content-Type"
+            }
+          );
+
+          return res.end();
+        }
+
+        if (
+          req.method === "GET" &&
+          url.pathname === "/"
+        ) {
+          return sendJson(
+            res,
+            200,
+            {
+              name: "JobBubble API",
+              status: "online"
+            }
+          );
+        }
+
+        if (
+          req.method === "GET" &&
+          url.pathname === "/health"
+        ) {
+          return sendJson(
+            res,
+            200,
+            {
+              status: "ok",
+
+              adzuna:
+                ADZUNA_APP_ID &&
+                ADZUNA_APP_KEY
+                  ? "enabled"
+                  : "disabled",
+
+              geoapify:
+                GEOAPIFY_API_KEY
+                  ? "enabled"
+                  : "disabled"
+            }
+          );
+        }
+
+        if (
+          req.method === "GET" &&
+          url.pathname === "/jobs"
+        ) {
+          return handleJobs(
+            req,
+            res,
+            url
+          );
+        }
+
+        return sendJson(
+          res,
+          404,
+          {
+            error: "Not found"
+          }
+        );
+      } catch (error) {
+        console.error(
+          "Unhandled request error:",
+          error
+        );
+
+        return sendJson(
+          res,
+          500,
+          {
+            error:
+              "Internal server error"
+          }
+        );
+      }
+    }
+  );
+
+server.listen(
+  PORT,
+  () => {
+    console.log(
+      `JobBubble backend listening on port ${PORT}`
+    );
+
+    console.log(
+      "Adzuna:",
+      ADZUNA_APP_ID &&
+      ADZUNA_APP_KEY
+        ? "enabled"
+        : "disabled"
+    );
+
+    console.log(
+      "Geoapify:",
+      GEOAPIFY_API_KEY
+        ? "enabled"
+        : "disabled"
+    );
+  }
+);
