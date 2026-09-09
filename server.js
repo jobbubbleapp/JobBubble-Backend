@@ -4,6 +4,8 @@ const PORT = process.env.PORT || 3000;
 const ADZUNA_APP_ID = process.env.ADZUNA_APP_ID;
 const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
 const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
+const USAJOBS_API_KEY = process.env.USAJOBS_API_KEY;
+const USAJOBS_EMAIL = process.env.USAJOBS_EMAIL;
 
 const GEO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const geoCache = new Map();
@@ -205,7 +207,9 @@ async function geoapifySearchOrigin(
       result.formatted ||
       String(where).trim()
   };
-}async function geoapifyLikelyWorkplace(job) {
+}
+
+async function geoapifyLikelyWorkplace(job) {
   if (
     !GEOAPIFY_API_KEY ||
     !job ||
@@ -216,10 +220,11 @@ async function geoapifySearchOrigin(
   }
 
   const cacheKey =
-    `${normalizeName(job.company)}|` +
-    `${String(job.location || "")
-      .toLowerCase()
-      .trim()}`;
+    normalizeName(job.company) +
+    "|" +
+    String(job.location || "")
+      .trim()
+      .toLowerCase();
 
   const cached = geoCache.get(cacheKey);
 
@@ -244,22 +249,9 @@ async function geoapifySearchOrigin(
     "countrycode:us"
   );
 
-  if (
-    validCoordinate(
-      job.latitude,
-      job.longitude
-    )
-  ) {
-    url.searchParams.set(
-      "bias",
-      `proximity:${job.longitude},${job.latitude}`
-    );
-  }
-
   url.searchParams.set("format", "json");
   url.searchParams.set("limit", "5");
   url.searchParams.set("lang", "en");
-
   url.searchParams.set(
     "apiKey",
     GEOAPIFY_API_KEY
@@ -271,9 +263,7 @@ async function geoapifySearchOrigin(
     });
 
     if (!response.ok) {
-      throw new Error(
-        `Geoapify workplace HTTP ${response.status}`
-      );
+      return null;
     }
 
     const data = await response.json();
@@ -287,25 +277,24 @@ async function geoapifySearchOrigin(
     let bestScore = 0;
 
     for (const result of results) {
-      const lat = Number(result.lat);
-      const lon = Number(result.lon);
-
-      if (!validCoordinate(lat, lon)) {
-        continue;
-      }
-
       const score = nameScore(
         job.company,
         result
       );
 
-      if (score > bestScore) {
+      const lat = Number(result.lat);
+      const lon = Number(result.lon);
+
+      if (
+        score > bestScore &&
+        validCoordinate(lat, lon)
+      ) {
         bestScore = score;
         best = result;
       }
     }
 
-    if (!best || bestScore < 55) {
+    if (!best || bestScore < 50) {
       geoCache.set(cacheKey, {
         time: Date.now(),
         value: null
@@ -314,24 +303,22 @@ async function geoapifySearchOrigin(
       return null;
     }
 
-    const match = {
+    const value = {
       latitude: Number(best.lat),
       longitude: Number(best.lon),
-
-      location:
+      formatted:
         best.formatted ||
-        best.address_line2 ||
+        best.address_line1 ||
         job.location,
-
       score: bestScore
     };
 
     geoCache.set(cacheKey, {
       time: Date.now(),
-      value: match
+      value
     });
 
-    return match;
+    return value;
   } catch (error) {
     console.error(
       "Geoapify workplace lookup failed:",
@@ -340,6 +327,240 @@ async function geoapifySearchOrigin(
 
     return null;
   }
+}function usaJobsSalaryPeriod(remuneration) {
+  const code = String(
+    remuneration?.RateIntervalCode || ""
+  ).toUpperCase();
+
+  const description = String(
+    remuneration?.Description || ""
+  ).toLowerCase();
+
+  if (code === "PH" || description.includes("hour")) {
+    return "hour";
+  }
+
+  if (code === "PD" || description.includes("day")) {
+    return "day";
+  }
+
+  if (code === "PW" || description.includes("week")) {
+    return "week";
+  }
+
+  if (code === "PM" || description.includes("month")) {
+    return "month";
+  }
+
+  return "year";
+}
+
+function closestUSAJobsLocation(locations, origin) {
+  const valid = (Array.isArray(locations) ? locations : [])
+    .map((location) => ({
+      raw: location,
+      latitude: Number(location?.Latitude),
+      longitude: Number(location?.Longitude)
+    }))
+    .filter((location) =>
+      validCoordinate(
+        location.latitude,
+        location.longitude
+      )
+    );
+
+  if (!valid.length) {
+    return null;
+  }
+
+  if (
+    !origin ||
+    !validCoordinate(
+      origin.latitude,
+      origin.longitude
+    )
+  ) {
+    return valid[0];
+  }
+
+  let best = valid[0];
+  let bestDistance = Infinity;
+
+  for (const location of valid) {
+    const distance = milesBetween(
+      origin.latitude,
+      origin.longitude,
+      location.latitude,
+      location.longitude
+    );
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = location;
+    }
+  }
+
+  return best;
+}
+
+function normalizeUSAJobsJob(item, origin) {
+  const descriptor =
+    item?.MatchedObjectDescriptor || {};
+
+  const bestLocation = closestUSAJobsLocation(
+    descriptor.PositionLocation,
+    origin
+  );
+
+  const providerLocation =
+    bestLocation?.raw?.LocationName ||
+    descriptor.PositionLocationDisplay ||
+    "";
+
+  const remuneration =
+    Array.isArray(descriptor.PositionRemuneration)
+      ? descriptor.PositionRemuneration[0]
+      : null;
+
+  const salaryMin = Number(
+    remuneration?.MinimumRange
+  );
+
+  const salaryMax = Number(
+    remuneration?.MaximumRange
+  );
+
+  const categories =
+    Array.isArray(descriptor.JobCategory)
+      ? descriptor.JobCategory
+      : [];
+
+  const applyUris =
+    Array.isArray(descriptor.ApplyURI)
+      ? descriptor.ApplyURI
+      : [];
+
+  const details =
+    descriptor.UserArea?.Details || {};
+
+  const exact =
+    looksLikeStreetAddress(providerLocation);
+
+  return {
+    id: String(
+      descriptor.PositionID ||
+      item?.MatchedObjectId ||
+      ""
+    ),
+
+    source: "USAJOBS",
+
+    title:
+      descriptor.PositionTitle ||
+      "Untitled job",
+
+    company:
+      descriptor.OrganizationName ||
+      descriptor.DepartmentName ||
+      "U.S. Government",
+
+    latitude:
+      bestLocation
+        ? bestLocation.latitude
+        : null,
+
+    longitude:
+      bestLocation
+        ? bestLocation.longitude
+        : null,
+
+    salary_min:
+      Number.isFinite(salaryMin)
+        ? salaryMin
+        : null,
+
+    salary_max:
+      Number.isFinite(salaryMax)
+        ? salaryMax
+        : null,
+
+    salary_period:
+      usaJobsSalaryPeriod(remuneration),
+
+    category:
+      categories[0]?.Name ||
+      "Federal Government",
+
+    location:
+      providerLocation,
+
+    description:
+      details.JobSummary ||
+      descriptor.QualificationSummary ||
+      descriptor.PositionFormattedDescription?.[0]?.Content ||
+      "",
+
+    apply_url:
+      applyUris[0] ||
+      descriptor.PositionURI ||
+      "",
+
+    posted_at:
+      descriptor.PublicationStartDate ||
+      descriptor.PositionStartDate ||
+      "",
+
+    location_precision:
+      exact
+        ? "exact"
+        : "area",
+
+    location_approximate:
+      !exact,
+
+    location_match_provider:
+      "USAJOBS"
+  };
+}
+
+function dedupeJobs(jobs) {
+  const seen = new Map();
+
+  for (const job of jobs) {
+    if (!job) continue;
+
+    const lat = Number(job.latitude);
+    const lon = Number(job.longitude);
+
+    const locationKey =
+      validCoordinate(lat, lon)
+        ? `${lat.toFixed(2)},${lon.toFixed(2)}`
+        : normalizeName(job.location);
+
+    const key = [
+      normalizeName(job.title),
+      normalizeName(job.company),
+      locationKey
+    ].join("|");
+
+    const existing = seen.get(key);
+
+    if (!existing) {
+      seen.set(key, job);
+      continue;
+    }
+
+    // Prefer the official USAJOBS listing if another
+    // provider also has the same federal job.
+    if (
+      job.source === "USAJOBS" &&
+      existing.source !== "USAJOBS"
+    ) {
+      seen.set(key, job);
+    }
+  }
+
+  return Array.from(seen.values());
 }
 
 function normalizeAdzunaJob(item) {
@@ -436,6 +657,21 @@ async function enrichJobLocation(job) {
 
     job.location_approximate =
       false;
+
+    return job;
+  }
+
+  // USAJOBS already supplies official location coordinates.
+  if (
+    job.source === "USAJOBS" &&
+    validCoordinate(
+      job.latitude,
+      job.longitude
+    )
+  ) {
+    job.location_precision = "area";
+    job.location_approximate = true;
+    job.location_match_provider = "USAJOBS";
 
     return job;
   }
@@ -566,6 +802,99 @@ async function enrichJobLocation(job) {
     : [];
 }
 
+async function fetchUSAJobs(
+  where,
+  radius,
+  query
+) {
+  if (
+    !USAJOBS_API_KEY ||
+    !USAJOBS_EMAIL
+  ) {
+    throw new Error(
+      "USAJOBS environment variables are missing"
+    );
+  }
+
+  const url = new URL(
+    "https://data.usajobs.gov/api/search"
+  );
+
+  url.searchParams.set(
+    "ResultsPerPage",
+    "50"
+  );
+
+  url.searchParams.set(
+    "Fields",
+    "Full"
+  );
+
+  url.searchParams.set(
+    "WhoMayApply",
+    "Public"
+  );
+
+  if (where) {
+    url.searchParams.set(
+      "LocationName",
+      where
+    );
+  }
+
+  if (query) {
+    url.searchParams.set(
+      "Keyword",
+      query
+    );
+  }
+
+  if (radius > 0 && where) {
+    url.searchParams.set(
+      "Radius",
+      String(
+        Math.min(radius, 100)
+      )
+    );
+  }
+
+  const response = await fetch(
+    url,
+    {
+      headers: {
+        "User-Agent": USAJOBS_EMAIL,
+        "Authorization-Key": USAJOBS_API_KEY,
+        "Accept": "application/json"
+      },
+
+      signal:
+        AbortSignal.timeout(
+          15000
+        )
+    }
+  );
+
+  if (!response.ok) {
+    const body =
+      await response.text();
+
+    throw new Error(
+      `USAJOBS HTTP ${response.status}: ` +
+      body.slice(0, 200)
+    );
+  }
+
+  const data =
+    await response.json();
+
+  const items =
+    data?.SearchResult?.SearchResultItems;
+
+  return Array.isArray(items)
+    ? items
+    : [];
+}
+
 async function handleJobs(
   req,
   res,
@@ -640,18 +969,79 @@ async function handleJobs(
       );
     }
 
-    const rawJobs =
-      await fetchAdzunaJobs(
-        where,
-        radius,
-        query
-      );
+    // Search both providers simultaneously.
+    const providerResults =
+      await Promise.allSettled([
+        fetchAdzunaJobs(
+          where,
+          radius,
+          query
+        ),
 
-    const normalized =
-      rawJobs.map(
+        fetchUSAJobs(
+          where,
+          radius,
+          query
+        )
+      ]);
+
+    const rawAdzuna =
+      providerResults[0].status === "fulfilled"
+        ? providerResults[0].value
+        : [];
+
+    const rawUSAJobs =
+      providerResults[1].status === "fulfilled"
+        ? providerResults[1].value
+        : [];
+
+    if (
+      providerResults[0].status === "rejected"
+    ) {
+      console.error(
+        "Adzuna request failed:",
+        providerResults[0].reason?.message ||
+        providerResults[0].reason
+      );
+    }
+
+    if (
+      providerResults[1].status === "rejected"
+    ) {
+      console.error(
+        "USAJOBS request failed:",
+        providerResults[1].reason?.message ||
+        providerResults[1].reason
+      );
+    }
+
+    if (
+      providerResults.every(
+        (result) =>
+          result.status === "rejected"
+      )
+    ) {
+      throw new Error(
+        "All job providers are currently unavailable"
+      );
+    }
+
+    const normalized = [
+      ...rawAdzuna.map(
         normalizeAdzunaJob
-      );
+      ),
 
+      ...rawUSAJobs.map(
+        (item) =>
+          normalizeUSAJobsJob(
+            item,
+            origin
+          )
+      )
+    ];
+
+    // Process Geoapify lookups in small parallel batches
+    // instead of doing them one-by-one.
     const enrichmentBatchSize = 8;
     const enriched = [];
 
@@ -663,8 +1053,7 @@ async function handleJobs(
       const batch =
         normalized.slice(
           i,
-          i +
-            enrichmentBatchSize
+          i + enrichmentBatchSize
         );
 
       const results =
@@ -694,8 +1083,7 @@ async function handleJobs(
                 );
 
               if (
-                distance >
-                radius
+                distance > radius
               ) {
                 return null;
               }
@@ -719,15 +1107,16 @@ async function handleJobs(
       }
     }
 
-    enriched.sort(
+    const deduped =
+      dedupeJobs(enriched);
+
+    deduped.sort(
       (a, b) =>
         Number(
-          a.distance_miles ||
-            0
+          a.distance_miles || 0
         ) -
         Number(
-          b.distance_miles ||
-            0
+          b.distance_miles || 0
         )
     );
 
@@ -736,7 +1125,7 @@ async function handleJobs(
       200,
       {
         count:
-          enriched.length,
+          deduped.length,
 
         search_location:
           origin.label,
@@ -751,7 +1140,7 @@ async function handleJobs(
           radius,
 
         jobs:
-          enriched
+          deduped
       }
     );
   } catch (error) {
@@ -830,6 +1219,12 @@ async function handleJobs(
               geoapify:
                 GEOAPIFY_API_KEY
                   ? "enabled"
+                  : "disabled",
+
+              usajobs:
+                USAJOBS_API_KEY &&
+                USAJOBS_EMAIL
+                  ? "enabled"
                   : "disabled"
             }
           );
@@ -889,6 +1284,14 @@ server.listen(
     console.log(
       "Geoapify:",
       GEOAPIFY_API_KEY
+        ? "enabled"
+        : "disabled"
+    );
+
+    console.log(
+      "USAJOBS:",
+      USAJOBS_API_KEY &&
+      USAJOBS_EMAIL
         ? "enabled"
         : "disabled"
     );
