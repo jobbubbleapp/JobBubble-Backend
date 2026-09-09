@@ -22,6 +22,8 @@ const MAX_ENRICH_JOBS = 40;
 const ENRICH_CONCURRENCY = 12;
 
 const geoCache = new Map();
+const postingPageCache = new Map();
+const POSTING_PAGE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // Reuse resolved workplaces so repeated jobs for the same employer/location do not
 // consume another external lookup. This is deliberately separate from geoCache so
 // it can use a much longer lifetime.
@@ -139,7 +141,7 @@ async function readPersistentWorkplace(cacheKey) {
     const longitude = Number(readFirestoreField(f.longitude));
     if (!validCoordinate(latitude, longitude)) return null;
     const confidence = readFirestoreField(f.confidence) || "medium";
-    // V9.4.33 only trusts high-confidence records from persistent storage.
+    // V9.4.34 only trusts high-confidence records from persistent storage.
     // Older medium-confidence documents remain harmless in Firestore but are ignored.
     if (confidence !== "high") return null;
     return {
@@ -249,6 +251,135 @@ function extractStreetAddress(text) {
     /\b\d{1,6}\s+[A-Za-z0-9.'#&\- ]{2,55}\s(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway)\b(?:\s*(?:,|#|suite|ste)\s*[A-Za-z0-9.\- ]{0,30})?/i
   );
   return match ? match[0].trim() : null;
+}
+
+
+function walkJsonForJobPosting(value, found = []) {
+  if (!value || found.length >= 6) return found;
+  if (Array.isArray(value)) {
+    for (const item of value) walkJsonForJobPosting(item, found);
+    return found;
+  }
+  if (typeof value !== "object") return found;
+  const type = value["@type"];
+  const types = Array.isArray(type) ? type : [type];
+  if (types.some((x) => String(x || "").toLowerCase() === "jobposting")) found.push(value);
+  if (value["@graph"]) walkJsonForJobPosting(value["@graph"], found);
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "@graph") continue;
+    if (child && typeof child === "object") walkJsonForJobPosting(child, found);
+  }
+  return found;
+}
+
+function addressFromJobPosting(posting) {
+  const locations = Array.isArray(posting?.jobLocation) ? posting.jobLocation : [posting?.jobLocation];
+  for (const loc of locations) {
+    const address = loc?.address || loc;
+    if (!address || typeof address !== "object") continue;
+    const street = String(address.streetAddress || "").trim();
+    const locality = String(address.addressLocality || "").trim();
+    const region = String(address.addressRegion || "").trim();
+    const postal = String(address.postalCode || "").trim();
+    const country = typeof address.addressCountry === "string"
+      ? address.addressCountry : String(address.addressCountry?.name || "").trim();
+    const parts = [street, locality, region, postal, country].filter(Boolean);
+    const text = parts.join(", ");
+    if (street && looksLikeStreetAddress(street)) return text;
+  }
+  return null;
+}
+
+async function postingPageStreetAddress(job) {
+  const applyUrl = String(job?.apply_url || "").trim();
+  if (!/^https?:\/\//i.test(applyUrl)) return null;
+  const cacheKey = `posting-page|${applyUrl}`;
+  const cached = postingPageCache.get(cacheKey);
+  if (cached && Date.now() - cached.time < POSTING_PAGE_CACHE_TTL_MS) return cached.value;
+
+  try {
+    const response = await fetch(applyUrl, {
+      redirect: "follow",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; JobBubble/9.4.34; +https://jobbubble-backend-1.onrender.com)",
+        "Accept": "text/html,application/xhtml+xml"
+      },
+      signal: AbortSignal.timeout(5500)
+    });
+    if (!response.ok) throw new Error(`posting page HTTP ${response.status}`);
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    if (!contentType.includes("text/html") && !contentType.includes("application/xhtml")) return null;
+    const html = (await response.text()).slice(0, 1_500_000);
+    const scripts = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
+    for (const script of scripts.slice(0, 30)) {
+      const bodyMatch = script.match(/>([\s\S]*?)<\/script>/i);
+      if (!bodyMatch) continue;
+      const body = bodyMatch[1].trim().replace(/^<!--|-->$/g, "").trim();
+      if (!body) continue;
+      try {
+        const parsed = JSON.parse(body);
+        const postings = walkJsonForJobPosting(parsed);
+        for (const posting of postings) {
+          const address = addressFromJobPosting(posting);
+          if (address) {
+            postingPageCache.set(cacheKey, { time: Date.now(), value: address });
+            return address;
+          }
+        }
+      } catch (_) {}
+    }
+  } catch (error) {
+    console.error("Posting-page address lookup failed:", error.message);
+  }
+  postingPageCache.set(cacheKey, { time: Date.now(), value: null });
+  return null;
+}
+
+async function geoapifyExplicitAddress(job, address, providerLabel) {
+  if (!GEOAPIFY_API_KEY || !address) return null;
+  const cacheKey = `explicit-address|${String(address).toLowerCase().trim()}`;
+  const cached = geoCache.get(cacheKey);
+  if (cached && Date.now() - cached.time < GEO_CACHE_TTL_MS) return cached.value;
+  const url = new URL("https://api.geoapify.com/v1/geocode/search");
+  url.searchParams.set("text", address);
+  url.searchParams.set("filter", "countrycode:us");
+  if (validCoordinate(job?.latitude, job?.longitude)) {
+    url.searchParams.set("bias", `proximity:${job.longitude},${job.latitude}`);
+  }
+  url.searchParams.set("format", "json");
+  url.searchParams.set("limit", "3");
+  url.searchParams.set("lang", "en");
+  url.searchParams.set("apiKey", GEOAPIFY_API_KEY);
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`Geoapify explicit-address HTTP ${response.status}`);
+    const data = await response.json();
+    const results = Array.isArray(data.results) ? data.results : [];
+    for (const result of results) {
+      const lat = Number(result.lat), lon = Number(result.lon);
+      if (!validCoordinate(lat, lon)) continue;
+      // An address explicitly supplied by the posting is stronger than an approximate
+      // provider pin. Still reject absurd geocodes far away from the provider area.
+      if (validCoordinate(job?.latitude, job?.longitude)) {
+        const miles = milesBetween(job.latitude, job.longitude, lat, lon);
+        if (miles > 35) continue;
+      }
+      const match = {
+        latitude: lat,
+        longitude: lon,
+        location: result.formatted || address,
+        score: 140,
+        confidence: "high",
+        reason: providerLabel || "posting-page-address"
+      };
+      geoCache.set(cacheKey, { time: Date.now(), value: match });
+      return match;
+    }
+  } catch (error) {
+    console.error("Explicit posting-address geocode failed:", error.message);
+  }
+  geoCache.set(cacheKey, { time: Date.now(), value: null });
+  return null;
 }
 
 function nameScore(company, result) {
@@ -669,43 +800,49 @@ async function enrichJobLocation(job) {
     return job;
   }
 
-  // First reuse a workplace we have already resolved for this employer/location.
+  // V9.4.34: trust evidence from the current posting before any learned cache.
+  // This prevents a stale branch match from overriding a street address that the
+  // employer actually supplied in the job description or structured posting data.
+  let postingAddress = await geoapifyAddressCandidate(job);
+  if (!postingAddress) {
+    const pageAddress = await postingPageStreetAddress(job);
+    if (pageAddress) postingAddress = await geoapifyExplicitAddress(job, pageAddress, "posting-page-address");
+  }
+  if (postingAddress) {
+    job.latitude = postingAddress.latitude;
+    job.longitude = postingAddress.longitude;
+    job.location = postingAddress.location;
+    job.location_precision = "exact";
+    job.location_approximate = false;
+    job.location_confidence = "high";
+    job.location_match_provider = postingAddress.reason === "posting-page-address"
+      ? "Employer/ATS posting address" : "Geoapify posting address";
+    rememberWorkplace(job, {
+      latitude: job.latitude,
+      longitude: job.longitude,
+      location: job.location,
+      precision: "exact",
+      confidence: "high"
+    });
+    return job;
+  }
+
   const cachedWorkplace = await getCachedWorkplace(job);
   if (cachedWorkplace) {
     job.latitude = cachedWorkplace.latitude;
     job.longitude = cachedWorkplace.longitude;
     job.location = cachedWorkplace.location || job.location;
     job.location_precision = cachedWorkplace.precision || "likely";
-    job.location_approximate = true;
+    job.location_approximate = cachedWorkplace.precision !== "exact";
     job.location_confidence = cachedWorkplace.confidence || "medium";
     job.location_match_provider = "JobBubble workplace cache";
     return job;
   }
 
-  // USAJOBS coordinates come from the official posting. Only promote them beyond
-  // area precision when the posting itself gives us a usable street address.
+  // USAJOBS postings often describe an official duty area rather than a public
+  // storefront. If there is no explicit street address, preserve the official
+  // area coordinate instead of inventing a building.
   if (job.source === "USAJOBS") {
-    const postingAddress = extractStreetAddress(job.description)
-      ? await geoapifyAddressCandidate(job)
-      : null;
-    if (postingAddress) {
-      job.latitude = postingAddress.latitude;
-      job.longitude = postingAddress.longitude;
-      job.location = postingAddress.location;
-      job.location_precision = "likely";
-      job.location_approximate = true;
-      job.location_confidence = "high";
-      job.location_match_provider = "Geoapify posting address";
-      rememberWorkplace(job, {
-        latitude: job.latitude,
-        longitude: job.longitude,
-        location: job.location,
-        precision: "likely",
-        confidence: "high"
-      });
-      return job;
-    }
-
     const estimate = await bestEstimateForJob(job);
     if (estimate) {
       job.latitude = estimate.latitude;
@@ -716,27 +853,6 @@ async function enrichJobLocation(job) {
       job.location_confidence = "low";
       job.location_match_provider = estimate.provider;
     }
-    return job;
-  }
-
-  // A street address written in the posting is the strongest clue after an exact
-  // provider address.
-  const postingAddress = await geoapifyAddressCandidate(job);
-  if (postingAddress) {
-    job.latitude = postingAddress.latitude;
-    job.longitude = postingAddress.longitude;
-    job.location = postingAddress.location;
-    job.location_precision = "likely";
-    job.location_approximate = true;
-    job.location_confidence = "high";
-    job.location_match_provider = "Geoapify posting address";
-    rememberWorkplace(job, {
-      latitude: job.latitude,
-      longitude: job.longitude,
-      location: job.location,
-      precision: "likely",
-      confidence: "high"
-    });
     return job;
   }
 
@@ -759,8 +875,6 @@ async function enrichJobLocation(job) {
     return job;
   }
 
-  // No confident workplace match: still return the best defensible estimate.
-  // This keeps the job on the map while clearly retaining approximate status.
   const estimate = await bestEstimateForJob(job);
   if (estimate) {
     job.latitude = estimate.latitude;
@@ -968,11 +1082,20 @@ async function buildSearch(params, cacheKey) {
   // an area-level pin closer to the actual workplace.
   const candidates = [];
   for (const job of normalized) {
-    if (!validCoordinate(job.latitude, job.longitude)) continue;
+    if (!validCoordinate(job.latitude, job.longitude)) {
+      // Keep coordinate-less postings long enough for description/ATS address
+      // extraction to rescue them during enrichment.
+      candidates.push(job);
+      continue;
+    }
     const distance = setDistance(job, origin);
     if (distance != null && distance <= radius + 12) candidates.push(job);
   }
-  candidates.sort((a, b) => Number(a.distance_miles || 0) - Number(b.distance_miles || 0));
+  candidates.sort((a, b) => {
+    const ad = Number.isFinite(Number(a.distance_miles)) ? Number(a.distance_miles) : Infinity;
+    const bd = Number.isFinite(Number(b.distance_miles)) ? Number(b.distance_miles) : Infinity;
+    return ad - bd;
+  });
 
   // Work on the closest jobs first because those are the ones most likely visible.
   const toEnrich = candidates.slice(0, MAX_ENRICH_JOBS);
@@ -1128,13 +1251,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.33" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.34" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.33",
+        version: "9.4.34",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -1143,6 +1266,8 @@ const server = http.createServer(async (req, res) => {
         workplace_cache_entries: workplaceCache.size,
         firestore_workplace_cache: firestoreEnabled ? "enabled" : "disabled",
         firestore_cache_policy: "high-confidence-only",
+        posting_address_lookup: "enabled",
+        posting_page_cache_entries: postingPageCache.size,
         searches_in_flight: inFlightSearches.size
       });
     }
@@ -1159,11 +1284,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.33 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.34 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
   console.log("Fast search cache: enabled");
   console.log("Firestore workplace cache:", firestoreEnabled ? "enabled" : "disabled");
   console.log("Firestore cache policy: high-confidence-only");
+  console.log("Posting address lookup: enabled");
 });
