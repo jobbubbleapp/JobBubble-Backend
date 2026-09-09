@@ -27,6 +27,9 @@ const geoCache = new Map();
 // it can use a much longer lifetime.
 const workplaceCache = new Map();
 const WORKPLACE_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+// Medium-confidence matches may help during the current server session, but expire
+// quickly and are never persisted to Firestore.
+const MEDIUM_WORKPLACE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 const jobCache = new Map();
 const inFlightSearches = new Map();
@@ -135,12 +138,16 @@ async function readPersistentWorkplace(cacheKey) {
     const latitude = Number(readFirestoreField(f.latitude));
     const longitude = Number(readFirestoreField(f.longitude));
     if (!validCoordinate(latitude, longitude)) return null;
+    const confidence = readFirestoreField(f.confidence) || "medium";
+    // V9.4.33 only trusts high-confidence records from persistent storage.
+    // Older medium-confidence documents remain harmless in Firestore but are ignored.
+    if (confidence !== "high") return null;
     return {
       latitude,
       longitude,
       location: readFirestoreField(f.location) || "",
       precision: readFirestoreField(f.precision) || "likely",
-      confidence: readFirestoreField(f.confidence) || "medium"
+      confidence
     };
   } catch (error) {
     console.error("Firestore workplace-cache read failed:", error.message);
@@ -443,7 +450,13 @@ async function geoapifyLikelyWorkplace(job) {
       return null;
     }
 
-    const confidence = best.score >= 105 || (best.companyScore >= 85 && closeToProvider)
+    // High confidence requires multiple independent signals: a strong employer-name
+    // match plus either very close provider coordinates or a clearly dominant score.
+    // Everything else remains useful as a temporary medium-confidence map refinement.
+    const dominant = !second || best.score - second.score >= 14;
+    const veryCloseToProvider = best.distance != null && best.distance <= 1.25;
+    const confidence = (best.companyScore >= 85 && veryCloseToProvider && dominant) ||
+      (best.score >= 118 && best.companyScore >= 85 && dominant)
       ? "high" : "medium";
     const match = {
       latitude: Number(best.result.lat),
@@ -481,7 +494,9 @@ async function getCachedWorkplace(job) {
   if (!key) return null;
   const cached = workplaceCache.get(key);
   if (cached) {
-    if (Date.now() - cached.time <= WORKPLACE_CACHE_TTL_MS) return cached.value || null;
+    const confidence = cached.value?.confidence || "medium";
+    const ttl = confidence === "high" ? WORKPLACE_CACHE_TTL_MS : MEDIUM_WORKPLACE_CACHE_TTL_MS;
+    if (Date.now() - cached.time <= ttl) return cached.value || null;
     workplaceCache.delete(key);
   }
 
@@ -496,10 +511,16 @@ async function getCachedWorkplace(job) {
 function rememberWorkplace(job, match) {
   const key = workplaceCacheKey(job);
   if (!key || !match || !validCoordinate(match.latitude, match.longitude)) return;
-  workplaceCache.set(key, { time: Date.now(), value: { ...match } });
-  // Do not slow the user's search response down for persistence. The in-memory
-  // cache is available immediately and Firestore is updated in the background.
-  writePersistentWorkplace(key, { ...match });
+
+  const confidence = String(match.confidence || "medium").toLowerCase();
+  const cachedMatch = { ...match, confidence };
+  workplaceCache.set(key, { time: Date.now(), value: cachedMatch });
+
+  // Only high-confidence matches become permanent learned workplaces. Medium
+  // matches can still improve the current session, but cannot poison Firestore.
+  if (confidence === "high") {
+    writePersistentWorkplace(key, cachedMatch);
+  }
 }
 
 async function bestEstimateForJob(job) {
@@ -1107,13 +1128,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.32" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.33" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.32",
+        version: "9.4.33",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -1121,6 +1142,7 @@ const server = http.createServer(async (req, res) => {
         geo_cache_entries: geoCache.size,
         workplace_cache_entries: workplaceCache.size,
         firestore_workplace_cache: firestoreEnabled ? "enabled" : "disabled",
+        firestore_cache_policy: "high-confidence-only",
         searches_in_flight: inFlightSearches.size
       });
     }
@@ -1137,10 +1159,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.32 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.33 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
   console.log("Fast search cache: enabled");
   console.log("Firestore workplace cache:", firestoreEnabled ? "enabled" : "disabled");
+  console.log("Firestore cache policy: high-confidence-only");
 });
