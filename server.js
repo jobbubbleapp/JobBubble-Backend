@@ -353,11 +353,35 @@ async function geoapifyAddressCandidate(job) {
   return null;
 }
 
+function locationContextTokens(value) {
+  const stop = new Set(["united", "states", "usa", "us", "county", "area"]);
+  return normalizeName(value).split(" ")
+    .filter((token) => token.length >= 2 && !stop.has(token));
+}
+
+function locationContextScore(jobLocation, result) {
+  const wanted = new Set(locationContextTokens(jobLocation));
+  if (!wanted.size) return 0;
+  const resultText = [
+    result?.city, result?.town, result?.village, result?.suburb,
+    result?.county, result?.state, result?.state_code,
+    result?.postcode, result?.formatted, result?.address_line2
+  ].filter(Boolean).join(" ");
+  const got = new Set(locationContextTokens(resultText));
+  let overlap = 0;
+  for (const token of wanted) if (got.has(token)) overlap++;
+  return Math.min(18, overlap * 6);
+}
+
 async function geoapifyLikelyWorkplace(job) {
   if (!GEOAPIFY_API_KEY || !job || looksLikeStreetAddress(job.location) ||
       isGenericCompanyName(job.company)) return null;
 
-  const cacheKey = `${normalizeName(job.company)}|${String(job.location || "").toLowerCase().trim()}`;
+  // Include the provider's approximate coordinate in the lookup cache. This keeps
+  // separate branches of the same chain in the same city from sharing one result.
+  const anchor = validCoordinate(job.latitude, job.longitude)
+    ? `${Number(job.latitude).toFixed(3)},${Number(job.longitude).toFixed(3)}` : "no-anchor";
+  const cacheKey = `workplace|${normalizeName(job.company)}|${String(job.location || "").toLowerCase().trim()}|${anchor}`;
   const cached = geoCache.get(cacheKey);
   if (cached && Date.now() - cached.time < GEO_CACHE_TTL_MS) return cached.value;
 
@@ -368,7 +392,7 @@ async function geoapifyLikelyWorkplace(job) {
     url.searchParams.set("bias", `proximity:${job.longitude},${job.latitude}`);
   }
   url.searchParams.set("format", "json");
-  url.searchParams.set("limit", "5");
+  url.searchParams.set("limit", "8");
   url.searchParams.set("lang", "en");
   url.searchParams.set("apiKey", GEOAPIFY_API_KEY);
 
@@ -378,38 +402,56 @@ async function geoapifyLikelyWorkplace(job) {
     const data = await response.json();
     const results = Array.isArray(data.results) ? data.results : [];
 
-    let best = null;
-    let bestScore = 0;
+    const ranked = [];
     for (const result of results) {
       const lat = Number(result.lat);
       const lon = Number(result.lon);
       if (!validCoordinate(lat, lon)) continue;
 
-      let score = nameScore(job.company, result);
+      const companyScore = nameScore(job.company, result);
+      if (companyScore < 45) continue;
+
+      let score = companyScore + locationContextScore(job.location, result);
+      let distance = null;
       if (validCoordinate(job.latitude, job.longitude)) {
-        const miles = milesBetween(job.latitude, job.longitude, lat, lon);
-        if (miles <= 2) score += 25;
-        else if (miles <= 5) score += 15;
-        else if (miles <= 12) score += 5;
-        else if (miles > 30) score -= 40;
+        distance = milesBetween(job.latitude, job.longitude, lat, lon);
+        if (distance <= 0.75) score += 35;
+        else if (distance <= 2) score += 28;
+        else if (distance <= 5) score += 16;
+        else if (distance <= 12) score += 6;
+        else if (distance <= 25) score -= 12;
+        else score -= 45;
       }
 
-      if (score > bestScore) {
-        bestScore = score;
-        best = result;
-      }
+      ranked.push({ result, score, distance, companyScore });
     }
 
-    if (!best || bestScore < 55) {
+    ranked.sort((a, b) => b.score - a.score || (a.distance ?? Infinity) - (b.distance ?? Infinity));
+    const best = ranked[0];
+    const second = ranked[1];
+
+    // Reject weak or ambiguous chain-branch matches. If two nearby branches score
+    // almost the same, keeping the provider area estimate is safer than pinning the
+    // job to the wrong store, restaurant, hospital, or warehouse.
+    const ambiguous = Boolean(
+      best && second && best.score - second.score < 9 &&
+      (best.distance == null || second.distance == null || Math.abs(best.distance - second.distance) < 2.5)
+    );
+    const closeToProvider = best && best.distance != null && best.distance <= 2;
+    if (!best || best.score < 72 || (ambiguous && !closeToProvider)) {
       geoCache.set(cacheKey, { time: Date.now(), value: null });
       return null;
     }
 
+    const confidence = best.score >= 105 || (best.companyScore >= 85 && closeToProvider)
+      ? "high" : "medium";
     const match = {
-      latitude: Number(best.lat),
-      longitude: Number(best.lon),
-      location: best.formatted || best.address_line2 || job.location,
-      score: bestScore
+      latitude: Number(best.result.lat),
+      longitude: Number(best.result.lon),
+      location: best.result.formatted || best.result.address_line2 || job.location,
+      score: best.score,
+      confidence,
+      distance_from_provider_miles: best.distance == null ? null : Math.round(best.distance * 10) / 10
     };
     geoCache.set(cacheKey, { time: Date.now(), value: match });
     return match;
@@ -425,7 +467,13 @@ function workplaceCacheKey(job) {
   const company = normalizeName(job.company);
   const location = normalizeName(job.location || "");
   if (!company) return null;
-  return `${company}|${location}`;
+
+  // Provider coordinates are intentionally part of the persistent key. A chain can
+  // have several locations in one city; a city-only key could poison future jobs by
+  // reusing the wrong branch for 90 days.
+  const anchor = validCoordinate(job.latitude, job.longitude)
+    ? `${Number(job.latitude).toFixed(2)},${Number(job.longitude).toFixed(2)}` : "no-anchor";
+  return `${company}|${location}|${anchor}`;
 }
 
 async function getCachedWorkplace(job) {
@@ -678,7 +726,7 @@ async function enrichJobLocation(job) {
     job.location = match.location;
     job.location_precision = "likely";
     job.location_approximate = true;
-    job.location_confidence = match.score >= 80 ? "high" : "medium";
+    job.location_confidence = match.confidence || (match.score >= 105 ? "high" : "medium");
     job.location_match_provider = "Geoapify workplace match";
     rememberWorkplace(job, {
       latitude: job.latitude,
@@ -1059,13 +1107,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.31" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.32" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.31",
+        version: "9.4.32",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -1089,7 +1137,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.31 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.32 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
