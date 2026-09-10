@@ -35,6 +35,27 @@ const MEDIUM_WORKPLACE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 const jobCache = new Map();
 const inFlightSearches = new Map();
+// V9.4.35 performance: collapse duplicate network work when several jobs resolve
+// the same posting page or workplace cache key at the same time.
+const postingPageInFlight = new Map();
+const workplaceReadInFlight = new Map();
+
+function pruneTimedCache(map, maxEntries, maxAgeMs) {
+  const now = Date.now();
+  for (const [key, value] of map) {
+    if (!value || !Number.isFinite(value.time) || now - value.time > maxAgeMs) map.delete(key);
+  }
+  while (map.size > maxEntries) map.delete(map.keys().next().value);
+}
+
+function maintainCaches() {
+  pruneTimedCache(jobCache, 120, JOB_STALE_TTL_MS * 2);
+  pruneTimedCache(geoCache, 2500, GEO_CACHE_TTL_MS);
+  pruneTimedCache(postingPageCache, 1200, POSTING_PAGE_CACHE_TTL_MS);
+  pruneTimedCache(workplaceCache, 2500, WORKPLACE_CACHE_TTL_MS);
+}
+const cacheMaintenanceTimer = setInterval(maintainCaches, 10 * 60 * 1000);
+if (cacheMaintenanceTimer.unref) cacheMaintenanceTimer.unref();
 
 const FIREBASE_SERVICE_ACCOUNT_PATH = process.env.FIREBASE_SERVICE_ACCOUNT_PATH || "/etc/secrets/firebase-service-account.json";
 let firebaseServiceAccount = null;
@@ -141,7 +162,7 @@ async function readPersistentWorkplace(cacheKey) {
     const longitude = Number(readFirestoreField(f.longitude));
     if (!validCoordinate(latitude, longitude)) return null;
     const confidence = readFirestoreField(f.confidence) || "medium";
-    // V9.4.34 only trusts high-confidence records from persistent storage.
+    // V9.4.35 only trusts high-confidence records from persistent storage.
     // Older medium-confidence documents remain harmless in Firestore but are ignored.
     if (confidence !== "high") return null;
     return {
@@ -290,7 +311,7 @@ function addressFromJobPosting(posting) {
   return null;
 }
 
-async function postingPageStreetAddress(job) {
+async function postingPageStreetAddressCore(job) {
   const applyUrl = String(job?.apply_url || "").trim();
   if (!/^https?:\/\//i.test(applyUrl)) return null;
   const cacheKey = `posting-page|${applyUrl}`;
@@ -301,7 +322,7 @@ async function postingPageStreetAddress(job) {
     const response = await fetch(applyUrl, {
       redirect: "follow",
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; JobBubble/9.4.34; +https://jobbubble-backend-1.onrender.com)",
+        "User-Agent": "Mozilla/5.0 (compatible; JobBubble/9.4.35; +https://jobbubble-backend-1.onrender.com)",
         "Accept": "text/html,application/xhtml+xml"
       },
       signal: AbortSignal.timeout(5500)
@@ -333,6 +354,18 @@ async function postingPageStreetAddress(job) {
   }
   postingPageCache.set(cacheKey, { time: Date.now(), value: null });
   return null;
+}
+
+async function postingPageStreetAddress(job) {
+  const applyUrl = String(job?.apply_url || "").trim();
+  if (!/^https?:\/\//i.test(applyUrl)) return null;
+  const inFlightKey = `posting-page|${applyUrl}`;
+  const existing = postingPageInFlight.get(inFlightKey);
+  if (existing) return existing;
+  const promise = postingPageStreetAddressCore(job)
+    .finally(() => postingPageInFlight.delete(inFlightKey));
+  postingPageInFlight.set(inFlightKey, promise);
+  return promise;
 }
 
 async function geoapifyExplicitAddress(job, address, providerLabel) {
@@ -620,7 +653,7 @@ function workplaceCacheKey(job) {
   return `${company}|${location}|${anchor}`;
 }
 
-async function getCachedWorkplace(job) {
+async function getCachedWorkplaceCore(job) {
   const key = workplaceCacheKey(job);
   if (!key) return null;
   const cached = workplaceCache.get(key);
@@ -637,6 +670,17 @@ async function getCachedWorkplace(job) {
     return persistent;
   }
   return null;
+}
+
+async function getCachedWorkplace(job) {
+  const key = workplaceCacheKey(job);
+  if (!key) return null;
+  const existing = workplaceReadInFlight.get(key);
+  if (existing) return existing;
+  const promise = getCachedWorkplaceCore(job)
+    .finally(() => workplaceReadInFlight.delete(key));
+  workplaceReadInFlight.set(key, promise);
+  return promise;
 }
 
 function rememberWorkplace(job, match) {
@@ -800,7 +844,7 @@ async function enrichJobLocation(job) {
     return job;
   }
 
-  // V9.4.34: trust evidence from the current posting before any learned cache.
+  // V9.4.35: trust evidence from the current posting before any learned cache.
   // This prevents a stale branch match from overriding a street address that the
   // employer actually supplied in the job description or structured posting data.
   let postingAddress = await geoapifyAddressCandidate(job);
@@ -1251,13 +1295,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.34" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.35" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.34",
+        version: "9.4.35",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -1284,7 +1328,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.34 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.35 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
