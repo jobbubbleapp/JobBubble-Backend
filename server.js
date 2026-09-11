@@ -1153,7 +1153,23 @@ async function buildSearch(params, cacheKey) {
     } else if (provider.label === "USAJOBS") {
       normalized.push(...provider.value.map((item) => normalizeUSAJobsJob(item, origin)));
     } else if (provider.label === "The Muse") {
-      normalized.push(...provider.value.map(normalizeMuseJob));
+      const museJobs = provider.value.map(normalizeMuseJob);
+      const requestedCity = String(where || "").split(",")[0].trim().toLowerCase();
+      for (const job of museJobs) {
+        const loc = String(job.location || "").toLowerCase();
+        // The Muse API returns location text but no coordinates. If the posting is
+        // explicitly in the searched city, anchor it to the search origin immediately
+        // so the first app response is not empty while Geoapify refines the pin.
+        if (!validCoordinate(job.latitude, job.longitude) && requestedCity && loc.includes(requestedCity)) {
+          job.latitude = origin.latitude;
+          job.longitude = origin.longitude;
+          job.location_precision = "area";
+          job.location_approximate = true;
+          job.location_confidence = "low";
+          job.location_match_provider = "The Muse search area";
+        }
+      }
+      normalized.push(...museJobs);
     } else if (provider.label === "CareerOneStop/NLx") {
       normalized.push(...provider.value.map(normalizeCareerOneStopJob));
     }
