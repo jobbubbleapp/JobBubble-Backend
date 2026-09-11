@@ -1,0 +1,35 @@
+name: Validate V9.4.44 Muse backend
+
+on:
+  push:
+    paths:
+      - '.github/workflows/validate-v944-muse.yml'
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check health
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 5 --retry-delay 3 'https://jobbubble-backend-1.onrender.com/health' | tee /tmp/health.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/health.json'))
+          assert d.get('version') == '9.4.44', d
+          assert d.get('themuse') == 'enabled', d
+          assert d.get('careeronestop') == 'hidden', d
+          print('Health check passed')
+          PY
+      - name: Check Muse job search
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 5 --retry-delay 3 --max-time 45 'https://jobbubble-backend-1.onrender.com/jobs?where=Seattle%2C%20WA&radius=100&source=themuse&refresh=1' | tee /tmp/jobs.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/jobs.json'))
+          assert 'error' not in d, d
+          assert isinstance(d.get('jobs'), list), d
+          assert d.get('source_filter') == 'themuse', d
+          print('Muse search passed; jobs:', len(d['jobs']))
+          PY
