@@ -1,0 +1,30 @@
+name: Fix V9.4.44 Muse results
+
+on:
+  push:
+    paths:
+      - 'scripts/fix_v944_muse_results.py'
+      - '.github/workflows/fix-v944-muse-results.yml'
+      - 'providers/themuse.js'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Apply Muse result fix
+        run: python3 scripts/fix_v944_muse_results.py
+      - name: Commit patched backend
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git diff --cached --quiet && exit 0
+          git commit -m "Fix Muse jobs appearing empty in app"
+          git push
