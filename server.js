@@ -1186,6 +1186,51 @@ async function resolveMuseAreaLocations(jobs, origin) {
   }
 }
 
+async function resolveMuseAreaLocations(jobs, origin) {
+  // Muse does not provide coordinates. Resolve each distinct provider location before
+  // building the first response so valid Muse jobs are not discarded merely because
+  // slower workplace/address enrichment has not finished yet.
+  const groups = new Map();
+  for (const job of jobs) {
+    if (job?.source !== "The Muse" || validCoordinate(job.latitude, job.longitude)) continue;
+    const location = String(job.location || "").trim();
+    if (!location || /\b(remote|anywhere|multiple locations)\b/i.test(location)) continue;
+    const key = location.toLowerCase();
+    if (!groups.has(key)) groups.set(key, { location, jobs: [] });
+    groups.get(key).jobs.push(job);
+  }
+
+  await runWithConcurrency(Array.from(groups.values()), 8, async (group) => {
+    let area = null;
+    try { area = await geoapifySearchOrigin(group.location, null, null); }
+    catch (error) { console.error("Muse area geocode failed:", error.message); }
+    if (!area || !validCoordinate(area.latitude, area.longitude)) return;
+    for (const job of group.jobs) {
+      job.latitude = area.latitude;
+      job.longitude = area.longitude;
+      job.location_precision = "area";
+      job.location_approximate = true;
+      job.location_confidence = "low";
+      job.location_match_provider = "The Muse/Geoapify area";
+    }
+  });
+
+  const requestedCity = String(origin?.label || "").split(",")[0].trim().toLowerCase();
+  if (requestedCity && validCoordinate(origin?.latitude, origin?.longitude)) {
+    for (const job of jobs) {
+      if (job?.source !== "The Muse" || validCoordinate(job.latitude, job.longitude)) continue;
+      if (String(job.location || "").toLowerCase().includes(requestedCity)) {
+        job.latitude = origin.latitude;
+        job.longitude = origin.longitude;
+        job.location_precision = "area";
+        job.location_approximate = true;
+        job.location_confidence = "low";
+        job.location_match_provider = "The Muse search area";
+      }
+    }
+  }
+}
+
 async function buildSearch(params, cacheKey) {
   const { where, radius, query, source, centerLat, centerLon } = params;
   const origin = await geoapifySearchOrigin(where, centerLat, centerLon);
