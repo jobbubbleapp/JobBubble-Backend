@@ -10,7 +10,9 @@ const USAJOBS_API_KEY = process.env.USAJOBS_API_KEY;
 const USAJOBS_EMAIL = process.env.USAJOBS_EMAIL;
 const CAREERONESTOP_USER_ID = process.env.CAREERONESTOP_USER_ID;
 const CAREERONESTOP_API_TOKEN = process.env.CAREERONESTOP_API_TOKEN;
+const THE_MUSE_API_KEY = process.env.THE_MUSE_API_KEY;
 const { fetchCareerOneStopJobs, normalizeCareerOneStopJob } = require("./providers/careeronestop");
+const { fetchMuseJobs, normalizeMuseJob } = require("./providers/themuse");
 
 // Geo results barely change, so keep them for a week.
 const GEO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1058,10 +1060,19 @@ async function fetchCareerOneStop(where, radius, query) {
   });
 }
 
+async function fetchTheMuse(where, radius, query) {
+  return fetchMuseJobs({
+    apiKey: THE_MUSE_API_KEY,
+    where, query, page: 1,
+    signal: AbortSignal.timeout(12000)
+  });
+}
+
 function normalizeSource(value) {
   const x = String(value || "all").trim().toLowerCase();
   if (x === "adzuna") return "adzuna";
   if (x === "usajobs" || x === "usa jobs" || x === "usa_jobs") return "usajobs";
+  if (x === "themuse" || x === "the muse" || x === "muse") return "themuse";
   if (x === "careeronestop" || x === "career one stop" || x === "career_one_stop" || x === "nlx") return "careeronestop";
   return "all";
 }
@@ -1099,7 +1110,13 @@ async function fetchSelectedProviders(source, where, radius, query) {
     labels.push("USAJOBS");
     tasks.push(fetchUSAJobs(where, radius, query));
   }
-  if (source === "all" || source === "careeronestop") {
+  if (source === "all" || source === "themuse") {
+    labels.push("The Muse");
+    tasks.push(fetchTheMuse(where, radius, query));
+  }
+  // CareerOneStop is preserved for possible future reactivation, but intentionally
+  // excluded from the public All Sources path.
+  if (source === "careeronestop") {
     labels.push("CareerOneStop/NLx");
     tasks.push(fetchCareerOneStop(where, radius, query));
   }
@@ -1135,7 +1152,9 @@ async function buildSearch(params, cacheKey) {
       normalized.push(...provider.value.map(normalizeAdzunaJob));
     } else if (provider.label === "USAJOBS") {
       normalized.push(...provider.value.map((item) => normalizeUSAJobsJob(item, origin)));
-      } else if (provider.label === "CareerOneStop/NLx") {
+    } else if (provider.label === "The Muse") {
+      normalized.push(...provider.value.map(normalizeMuseJob));
+    } else if (provider.label === "CareerOneStop/NLx") {
       normalized.push(...provider.value.map(normalizeCareerOneStopJob));
     }
   }
@@ -1314,17 +1333,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.42" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.44" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.42",
+        version: "9.4.44",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
-      careeronestop: CAREERONESTOP_USER_ID && CAREERONESTOP_API_TOKEN ? "enabled" : "disabled",
+        themuse: THE_MUSE_API_KEY ? "enabled" : "disabled",
+        careeronestop: "hidden",
         job_cache_entries: jobCache.size,
         geo_cache_entries: geoCache.size,
         workplace_cache_entries: workplaceCache.size,
@@ -1348,10 +1368,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.42 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.44 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
+  console.log("The Muse:", THE_MUSE_API_KEY ? "enabled" : "disabled");
+  console.log("CareerOneStop: hidden from public source selection");
   console.log("Fast search cache: enabled");
   console.log("Firestore workplace cache:", firestoreEnabled ? "enabled" : "disabled");
   console.log("Firestore cache policy: high-confidence-only");
