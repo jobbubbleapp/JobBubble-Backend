@@ -8,6 +8,9 @@ const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
 const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
 const USAJOBS_API_KEY = process.env.USAJOBS_API_KEY;
 const USAJOBS_EMAIL = process.env.USAJOBS_EMAIL;
+const CAREERONESTOP_USER_ID = process.env.CAREERONESTOP_USER_ID;
+const CAREERONESTOP_API_TOKEN = process.env.CAREERONESTOP_API_TOKEN;
+const { fetchCareerOneStopJobs, normalizeCareerOneStopJob } = require("./providers/careeronestop");
 
 // Geo results barely change, so keep them for a week.
 const GEO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -322,7 +325,7 @@ async function postingPageStreetAddressCore(job) {
     const response = await fetch(applyUrl, {
       redirect: "follow",
       headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; JobBubble/9.4.35; +https://jobbubble-backend-1.onrender.com)",
+        "User-Agent": "Mozilla/5.0 (compatible; JobBubble/9.4.42; +https://jobbubble-backend-1.onrender.com)",
         "Accept": "text/html,application/xhtml+xml"
       },
       signal: AbortSignal.timeout(5500)
@@ -1046,10 +1049,20 @@ async function fetchUSAJobs(where, radius, query) {
   return Array.isArray(items) ? items : [];
 }
 
+async function fetchCareerOneStop(where, radius, query) {
+  return fetchCareerOneStopJobs({
+    userId: CAREERONESTOP_USER_ID,
+    apiToken: CAREERONESTOP_API_TOKEN,
+    where, radius, query, pageSize: 50, days: 60,
+    signal: AbortSignal.timeout(12000)
+  });
+}
+
 function normalizeSource(value) {
   const x = String(value || "all").trim().toLowerCase();
   if (x === "adzuna") return "adzuna";
   if (x === "usajobs" || x === "usa jobs" || x === "usa_jobs") return "usajobs";
+  if (x === "careeronestop" || x === "career one stop" || x === "career_one_stop" || x === "nlx") return "careeronestop";
   return "all";
 }
 
@@ -1086,6 +1099,10 @@ async function fetchSelectedProviders(source, where, radius, query) {
     labels.push("USAJOBS");
     tasks.push(fetchUSAJobs(where, radius, query));
   }
+  if (source === "all" || source === "careeronestop") {
+    labels.push("CareerOneStop/NLx");
+    tasks.push(fetchCareerOneStop(where, radius, query));
+  }
 
   const results = await Promise.allSettled(tasks);
   const successful = [];
@@ -1118,6 +1135,8 @@ async function buildSearch(params, cacheKey) {
       normalized.push(...provider.value.map(normalizeAdzunaJob));
     } else if (provider.label === "USAJOBS") {
       normalized.push(...provider.value.map((item) => normalizeUSAJobsJob(item, origin)));
+      } else if (provider.label === "CareerOneStop/NLx") {
+      normalized.push(...provider.value.map(normalizeCareerOneStopJob));
     }
   }
 
@@ -1295,16 +1314,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.35" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.42" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.35",
+        version: "9.4.42",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
+      careeronestop: CAREERONESTOP_USER_ID && CAREERONESTOP_API_TOKEN ? "enabled" : "disabled",
         job_cache_entries: jobCache.size,
         geo_cache_entries: geoCache.size,
         workplace_cache_entries: workplaceCache.size,
@@ -1328,7 +1348,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.35 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.42 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
