@@ -1,5 +1,7 @@
 from pathlib import Path
 
+# Idempotent patch. This comment change intentionally re-runs the live verification
+# workflow after the backend fix has finished deploying to Render.
 p=Path('server.js')
 s=p.read_text()
 marker='async function buildSearch(params, cacheKey) {'
@@ -32,8 +34,6 @@ helper=r'''async function resolveMuseAreaLocations(jobs, origin) {
     }
   });
 
-  // A posting whose Muse location explicitly names the requested city can safely use
-  // the already-resolved search centroid if its location geocode failed.
   const requestedCity = String(origin?.label || "").split(",")[0].trim().toLowerCase();
   if (requestedCity && validCoordinate(origin?.latitude, origin?.longitude)) {
     for (const job of jobs) {
