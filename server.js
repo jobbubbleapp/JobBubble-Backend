@@ -1098,7 +1098,7 @@ function cloneResponse(value, overrides = {}) {
   };
 }
 
-async function fetchSelectedProviders(source, where, radius, query) {
+async function fetchSelectedProviders(source, where, radius, query, centerLat, centerLon) {
   const tasks = [];
   const labels = [];
 
@@ -1112,7 +1112,9 @@ async function fetchSelectedProviders(source, where, radius, query) {
   }
   if (source === "all" || source === "themuse") {
     labels.push("The Muse");
-    tasks.push(fetchTheMuse(where, radius, query));
+    const museWhere = validCoordinate(centerLat, centerLon)
+      ? `${centerLat},${centerLon}` : where;
+    tasks.push(fetchTheMuse(museWhere, radius, query));
   }
   // CareerOneStop is preserved for possible future reactivation, but intentionally
   // excluded from the public All Sources path.
@@ -1168,53 +1170,6 @@ async function resolveMuseAreaLocations(jobs, origin) {
     }
   });
 
-  // A posting whose Muse location explicitly names the requested city can safely use
-  // the already-resolved search centroid if its location geocode failed.
-  const requestedCity = String(origin?.label || "").split(",")[0].trim().toLowerCase();
-  if (requestedCity && validCoordinate(origin?.latitude, origin?.longitude)) {
-    for (const job of jobs) {
-      if (job?.source !== "The Muse" || validCoordinate(job.latitude, job.longitude)) continue;
-      if (String(job.location || "").toLowerCase().includes(requestedCity)) {
-        job.latitude = origin.latitude;
-        job.longitude = origin.longitude;
-        job.location_precision = "area";
-        job.location_approximate = true;
-        job.location_confidence = "low";
-        job.location_match_provider = "The Muse search area";
-      }
-    }
-  }
-}
-
-async function resolveMuseAreaLocations(jobs, origin) {
-  // Muse does not provide coordinates. Resolve each distinct provider location before
-  // building the first response so valid Muse jobs are not discarded merely because
-  // slower workplace/address enrichment has not finished yet.
-  const groups = new Map();
-  for (const job of jobs) {
-    if (job?.source !== "The Muse" || validCoordinate(job.latitude, job.longitude)) continue;
-    const location = String(job.location || "").trim();
-    if (!location || /\b(remote|anywhere|multiple locations)\b/i.test(location)) continue;
-    const key = location.toLowerCase();
-    if (!groups.has(key)) groups.set(key, { location, jobs: [] });
-    groups.get(key).jobs.push(job);
-  }
-
-  await runWithConcurrency(Array.from(groups.values()), 8, async (group) => {
-    let area = null;
-    try { area = await geoapifySearchOrigin(group.location, null, null); }
-    catch (error) { console.error("Muse area geocode failed:", error.message); }
-    if (!area || !validCoordinate(area.latitude, area.longitude)) return;
-    for (const job of group.jobs) {
-      job.latitude = area.latitude;
-      job.longitude = area.longitude;
-      job.location_precision = "area";
-      job.location_approximate = true;
-      job.location_confidence = "low";
-      job.location_match_provider = "The Muse/Geoapify area";
-    }
-  });
-
   const requestedCity = String(origin?.label || "").split(",")[0].trim().toLowerCase();
   if (requestedCity && validCoordinate(origin?.latitude, origin?.longitude)) {
     for (const job of jobs) {
@@ -1236,7 +1191,7 @@ async function buildSearch(params, cacheKey) {
   const origin = await geoapifySearchOrigin(where, centerLat, centerLon);
   if (!origin) throw new Error("Could not resolve the requested search location.");
 
-  const providerResults = await fetchSelectedProviders(source, where, radius, query);
+  const providerResults = await fetchSelectedProviders(source, where, radius, query, origin.latitude, origin.longitude);
   const normalized = [];
 
   for (const provider of providerResults) {
