@@ -1,6 +1,7 @@
 "use strict";
 
 const MUSE_API_URL = "https://www.themuse.com/api/public/jobs";
+const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
 
 const MUSE_CATEGORIES = new Set([
   "Account Management","Accounting and Finance","Administration and Office",
@@ -47,6 +48,43 @@ function matchesQuery(item, query) {
   return hits >= Math.max(1, Math.ceil(words.length * 0.6));
 }
 
+function coordinateWhere(value) {
+  const match = String(value || "").trim().match(/^\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$/);
+  if (!match) return null;
+  const latitude = Number(match[1]);
+  const longitude = Number(match[2]);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+  return { latitude, longitude };
+}
+
+async function resolveMuseWhere(where, signal) {
+  const coordinates = coordinateWhere(where);
+  if (!coordinates || !GEOAPIFY_API_KEY) return String(where || "").trim();
+  try {
+    const url = new URL("https://api.geoapify.com/v1/geocode/reverse");
+    url.searchParams.set("lat", String(coordinates.latitude));
+    url.searchParams.set("lon", String(coordinates.longitude));
+    url.searchParams.set("format", "json");
+    url.searchParams.set("lang", "en");
+    url.searchParams.set("apiKey", GEOAPIFY_API_KEY);
+    const response = await fetch(url, { headers: { "Accept": "application/json" }, signal });
+    if (!response.ok) throw new Error(`Geoapify reverse HTTP ${response.status}`);
+    const data = await response.json();
+    const result = Array.isArray(data?.results) ? data.results[0] : null;
+    if (!result) return String(where || "").trim();
+    const city = result.city || result.town || result.village || result.municipality || result.county || "";
+    const state = result.state_code || result.state || "";
+    const resolved = [city, state].filter(Boolean).join(", ").trim();
+    if (resolved) {
+      console.log(`The Muse search location resolved from coordinates: ${resolved}`);
+      return resolved;
+    }
+  } catch (error) {
+    console.error("The Muse coordinate reverse-geocode failed:", error.message);
+  }
+  return String(where || "").trim();
+}
+
 async function fetchMusePage({ apiKey, where, category, page, signal }) {
   const url = new URL(MUSE_API_URL);
   url.searchParams.set("api_key", apiKey);
@@ -85,9 +123,10 @@ async function fetchMuseJobs({ apiKey, where, query, page = 1, signal }) {
   const rawQuery = String(query || "").trim();
   const category = Array.from(MUSE_CATEGORIES).find(x => x.toLowerCase() === rawQuery.toLowerCase()) || "";
   const firstPage = Math.max(1, Number(page) || 1);
+  const resolvedWhere = await resolveMuseWhere(where, signal);
 
   let combined = [];
-  for (const candidateWhere of locationVariants(where)) {
+  for (const candidateWhere of locationVariants(resolvedWhere)) {
     combined = await fetchBatch({ apiKey, where: candidateWhere, category, firstPage, signal });
     if (combined.length) break;
   }
