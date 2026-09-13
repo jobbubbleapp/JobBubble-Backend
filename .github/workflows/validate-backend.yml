@@ -1,0 +1,113 @@
+name: Validate JobBubble backend
+
+on:
+  push:
+    branches:
+      - main
+      - refactor/backend-cleanup
+    paths:
+      - '.github/workflows/validate-backend.yml'
+      - 'providers/**'
+      - 'server.js'
+      - 'package.json'
+      - '.env.example'
+  pull_request:
+    paths:
+      - 'providers/**'
+      - 'server.js'
+      - 'package.json'
+      - '.env.example'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Validate syntax
+        run: |
+          node --check server.js
+          node --check providers/ats.js
+          node --check providers/themuse.js
+      - name: Fetch and validate live public ATS jobs
+        run: |
+          node - <<'NODE'
+          const { fetchAtsJobs, getAtsBoards } = require('./providers/ats');
+
+          (async () => {
+            const boards = getAtsBoards();
+            const jobs = await fetchAtsJobs({ signal: AbortSignal.timeout(30000) });
+            if (!jobs.length) throw new Error('Public ATS feeds returned zero jobs');
+
+            const sources = new Set(jobs.map(job => job.source));
+            const expected = ['ATS/Greenhouse', 'ATS/Lever', 'ATS/Ashby'];
+            const missing = expected.filter(source => !sources.has(source));
+            if (missing.length) throw new Error(`No live jobs returned for: ${missing.join(', ')}`);
+
+            const bad = jobs.find(job => !job.id || !job.title || !job.company || !job.apply_url);
+            if (bad) throw new Error(`Malformed ATS job: ${JSON.stringify(bad).slice(0, 500)}`);
+
+            for (const provider of ['greenhouse', 'lever', 'ashby']) {
+              const providerJobs = await fetchAtsJobs({ provider, signal: AbortSignal.timeout(30000) });
+              if (!providerJobs.length) throw new Error(`${provider} returned zero jobs`);
+              if (providerJobs.some(job => job.ats_provider !== provider)) {
+                throw new Error(`${provider} source filter leaked jobs from another ATS`);
+              }
+            }
+
+            console.log(`Live ATS validation passed: ${jobs.length} jobs from ${boards.length} boards`);
+            console.log(`Sources: ${Array.from(sources).join(', ')}`);
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+      - name: Validate runtime wiring
+        run: |
+          grep -q 'MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH = 24' server.js
+          grep -q 'return "greenhouse"' server.js
+          grep -q 'return "lever"' server.js
+          grep -q 'return "ashby"' server.js
+          grep -q 'POST" && url.pathname === "/report-bug"' server.js
+          grep -q 'GITHUB_ISSUES_TOKEN' server.js
+          grep -q 'BUG_REPORT_MAX_PER_WINDOW = 5' server.js
+          ! grep -q 'CareerOneStop' server.js
+          ! grep -q 'careerjet' server.js
+      - name: Start backend and smoke-test HTTP endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=3100 node server.js >/tmp/jobbubble-server.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:3100/ >/tmp/root.json; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3100/ >/tmp/root.json
+          curl -fsS http://127.0.0.1:3100/health >/tmp/health.json
+          grep -q '9.4.47' /tmp/root.json
+          grep -q '"ats":"enabled"' /tmp/health.json
+
+          BAD_STATUS=$(curl -sS -o /tmp/bad-report.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:3100/report-bug \
+            -H 'Content-Type: application/json' \
+            --data '{"description":"x"}')
+          test "$BAD_STATUS" = "400"
+
+          REPORT_STATUS=$(curl -sS -o /tmp/report.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:3100/report-bug \
+            -H 'Content-Type: application/json' \
+            --data '{"description":"Backend CI bug-report smoke test","app_version":"9.4.47","android_version":"test","device_model":"CI","screen":"CI"}')
+          test "$REPORT_STATUS" = "503"
+          grep -q 'temporarily unavailable' /tmp/report.json
+
+          OPTIONS=$(curl -sSI -X OPTIONS http://127.0.0.1:3100/report-bug | tr -d '\r')
+          echo "$OPTIONS" | grep -q 'Access-Control-Allow-Methods: GET,POST,OPTIONS'
+          cat /tmp/root.json
+          cat /tmp/health.json
