@@ -4,11 +4,12 @@ on:
   push:
     branches:
       - main
-      - fix/ats-postmerge-check
+      - feature/bug-report-api
     paths:
       - '.github/workflows/validate-v945-ats.yml'
       - 'providers/ats.js'
       - 'server.js'
+      - '.env.example'
 
 permissions:
   contents: read
@@ -58,14 +59,19 @@ jobs:
             process.exit(1);
           });
           NODE
-      - name: Validate ATS safety wiring
+      - name: Validate ATS and bug-report safety wiring
         run: |
           grep -q 'MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH = 24' server.js
           grep -q 'return "greenhouse"' server.js
           grep -q 'return "lever"' server.js
           grep -q 'return "ashby"' server.js
+          grep -q 'POST" && url.pathname === "/report-bug"' server.js
+          grep -q 'GITHUB_ISSUES_TOKEN' server.js
+          grep -q 'BUG_REPORT_MAX_PER_WINDOW = 5' server.js
       - name: Start backend and smoke-test HTTP endpoints
+        shell: bash
         run: |
+          set -euo pipefail
           PORT=3100 node server.js >/tmp/jobbubble-server.log 2>&1 &
           PID=$!
           trap 'kill $PID 2>/dev/null || true' EXIT
@@ -75,7 +81,24 @@ jobs:
           done
           curl -fsS http://127.0.0.1:3100/ >/tmp/root.json
           curl -fsS http://127.0.0.1:3100/health >/tmp/health.json
-          grep -q '9.4.46' /tmp/root.json
+          grep -q '9.4.47' /tmp/root.json
           grep -q '"ats":"enabled"' /tmp/health.json
+          grep -q '"github_bug_reporting":"needs_token"' /tmp/health.json
+
+          BAD_STATUS=$(curl -sS -o /tmp/bad-report.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:3100/report-bug \
+            -H 'Content-Type: application/json' \
+            --data '{"description":"x"}')
+          test "$BAD_STATUS" = "400"
+
+          REPORT_STATUS=$(curl -sS -o /tmp/report.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:3100/report-bug \
+            -H 'Content-Type: application/json' \
+            --data '{"description":"Backend CI bug-report smoke test","app_version":"9.4.47","android_version":"test","device_model":"CI","screen":"CI"}')
+          test "$REPORT_STATUS" = "503"
+          grep -q 'temporarily unavailable' /tmp/report.json
+
+          OPTIONS=$(curl -sSI -X OPTIONS http://127.0.0.1:3100/report-bug | tr -d '\r')
+          echo "$OPTIONS" | grep -q 'Access-Control-Allow-Methods: GET,POST,OPTIONS'
           cat /tmp/root.json
           cat /tmp/health.json
