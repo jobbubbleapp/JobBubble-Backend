@@ -89,6 +89,7 @@ function intervalToPeriod(interval) {
 }
 
 function safeNumber(value) {
+  if (value == null || String(value).trim() === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -303,14 +304,18 @@ function tokenMatch(haystack, query) {
   return tokens.every((token) => text.includes(token));
 }
 
-function filterAtsJobs(jobs, { query = "" } = {}) {
-  if (!query) return jobs;
-  return jobs.filter((job) => tokenMatch([
+function filterAtsJobs(jobs, { query = "", provider = "" } = {}) {
+  const providerKey = normalizeProvider(provider);
+  let filtered = providerKey
+    ? jobs.filter((job) => String(job?.ats_provider || "").toLowerCase() === providerKey)
+    : jobs;
+  if (!query) return filtered;
+  return filtered.filter((job) => tokenMatch([
     job.title, job.company, job.category, job.description
   ].join(" "), query));
 }
 
-async function fetchAtsJobs({ query = "", signal } = {}) {
+async function fetchAtsJobs({ query = "", provider = "", signal } = {}) {
   const boards = getAtsBoards();
   const settled = await Promise.allSettled(
     boards.map((board) => fetchBoardCached(board, signal))
@@ -330,7 +335,7 @@ async function fetchAtsJobs({ query = "", signal } = {}) {
     throw new Error("All configured ATS feeds are currently unavailable");
   }
 
-  return filterAtsJobs(jobs, { query });
+  return filterAtsJobs(jobs, { query, provider });
 }
 
 module.exports = {

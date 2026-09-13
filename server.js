@@ -26,6 +26,10 @@ const JOB_STALE_TTL_MS = 10 * 60 * 1000;
 const FIRST_RESPONSE_ENRICH_WAIT_MS = 1200;
 const MAX_ENRICH_JOBS = 40;
 const ENRICH_CONCURRENCY = 12;
+// Prevent a nationwide ATS feed from turning one local search into hundreds of
+// pre-response geocoding calls. Exact-city jobs are anchored immediately; only a
+// bounded set of remaining location groups is geocoded before radius filtering.
+const MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH = 24;
 
 const geoCache = new Map();
 const postingPageCache = new Map();
@@ -1074,7 +1078,10 @@ function normalizeSource(value) {
   if (x === "adzuna") return "adzuna";
   if (x === "usajobs" || x === "usa jobs" || x === "usa_jobs") return "usajobs";
   if (x === "themuse" || x === "the muse" || x === "muse") return "themuse";
-  if (x === "ats" || x === "greenhouse" || x === "lever" || x === "ashby") return "ats";
+  if (x === "ats") return "ats";
+  if (x === "greenhouse") return "greenhouse";
+  if (x === "lever") return "lever";
+  if (x === "ashby") return "ashby";
   if (x === "careeronestop" || x === "career one stop" || x === "career_one_stop" || x === "nlx") return "careeronestop";
   return "all";
 }
@@ -1118,10 +1125,12 @@ async function fetchSelectedProviders(source, where, radius, query, centerLat, c
       ? `${centerLat},${centerLon}` : where;
     tasks.push(fetchTheMuse(museWhere, radius, query));
   }
-  if (source === "all" || source === "ats") {
+  if (["all", "ats", "greenhouse", "lever", "ashby"].includes(source)) {
     labels.push("ATS");
+    const atsProvider = ["greenhouse", "lever", "ashby"].includes(source) ? source : "";
     tasks.push(fetchAtsJobs({
       query,
+      provider: atsProvider,
       signal: AbortSignal.timeout(12000)
     }));
   }
@@ -1151,9 +1160,30 @@ async function fetchSelectedProviders(source, where, radius, query, centerLat, c
 }
 
 async function resolveMuseAreaLocations(jobs, origin) {
-  // Muse does not provide coordinates. Resolve each distinct provider location before
-  // building the first response so valid Muse jobs are not discarded merely because
-  // slower workplace/address enrichment has not finished yet.
+  // Muse and public ATS feeds often provide text locations without coordinates.
+  // Anchor exact-city matches for free, then geocode only a bounded number of the
+  // remaining distinct locations so a large nationwide ATS feed cannot fan out into
+  // hundreds of Geoapify requests during one user search.
+  const originParts = String(origin?.label || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const requestedCity = String(originParts[0] || "").toLowerCase();
+  const requestedRegion = String(originParts[1] || "").toLowerCase();
+
+  if (requestedCity && validCoordinate(origin?.latitude, origin?.longitude)) {
+    for (const job of jobs) {
+      const textOnlySource = job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/");
+      if (!textOnlySource || validCoordinate(job.latitude, job.longitude)) continue;
+      const location = String(job.location || "").toLowerCase();
+      if (!location.includes(requestedCity)) continue;
+      job.latitude = origin.latitude;
+      job.longitude = origin.longitude;
+      job.location_precision = "area";
+      job.location_approximate = true;
+      job.location_confidence = "low";
+      job.location_match_provider = job.source === "The Muse"
+        ? "The Muse search area" : `${job.source} search area`;
+    }
+  }
+
   const groups = new Map();
   for (const job of jobs) {
     const textOnlySource = job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/");
@@ -1161,14 +1191,22 @@ async function resolveMuseAreaLocations(jobs, origin) {
     const location = String(job.location || "").trim();
     if (!location || /\b(remote|anywhere|multiple locations)\b/i.test(location)) continue;
     const key = location.toLowerCase();
-    if (!groups.has(key)) groups.set(key, { location, jobs: [] });
+    if (!groups.has(key)) groups.set(key, {
+      location,
+      jobs: [],
+      priority: requestedRegion && key.includes(requestedRegion) ? 0 : 1
+    });
     groups.get(key).jobs.push(job);
   }
 
-  await runWithConcurrency(Array.from(groups.values()), 8, async (group) => {
+  const groupsToResolve = Array.from(groups.values())
+    .sort((a, b) => a.priority - b.priority)
+    .slice(0, MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH);
+
+  await runWithConcurrency(groupsToResolve, 8, async (group) => {
     let area = null;
     try { area = await geoapifySearchOrigin(group.location, null, null); }
-    catch (error) { console.error("Muse area geocode failed:", error.message); }
+    catch (error) { console.error("Text location geocode failed:", error.message); }
     if (!area || !validCoordinate(area.latitude, area.longitude)) return;
     for (const job of group.jobs) {
       job.latitude = area.latitude;
@@ -1180,23 +1218,6 @@ async function resolveMuseAreaLocations(jobs, origin) {
         ? "The Muse/Geoapify area" : `${job.source}/Geoapify area`;
     }
   });
-
-  const requestedCity = String(origin?.label || "").split(",")[0].trim().toLowerCase();
-  if (requestedCity && validCoordinate(origin?.latitude, origin?.longitude)) {
-    for (const job of jobs) {
-      const textOnlySource = job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/");
-    if (!textOnlySource || validCoordinate(job.latitude, job.longitude)) continue;
-      if (String(job.location || "").toLowerCase().includes(requestedCity)) {
-        job.latitude = origin.latitude;
-        job.longitude = origin.longitude;
-        job.location_precision = "area";
-        job.location_approximate = true;
-        job.location_confidence = "low";
-        job.location_match_provider = job.source === "The Muse"
-          ? "The Muse search area" : `${job.source} search area`;
-      }
-    }
-  }
 }
 
 async function buildSearch(params, cacheKey) {
@@ -1421,13 +1442,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.45" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.46" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.45",
+        version: "9.4.46",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -1458,7 +1479,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.45 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.46 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
