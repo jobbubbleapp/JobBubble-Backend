@@ -1,0 +1,68 @@
+name: Apply and validate V9.4.47 bug reporting
+
+on:
+  push:
+    branches:
+      - feature/bug-report-api
+    paths:
+      - 'scripts/patch_v947_bug_reporting.py'
+      - '.github/workflows/apply-v947-bug-report.yml'
+      - '.env.example'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Apply backend bug reporting patch
+        run: python3 scripts/patch_v947_bug_reporting.py
+      - name: Validate syntax and wiring
+        run: |
+          node --check server.js
+          grep -q 'POST" && url.pathname === "/report-bug"' server.js
+          grep -q 'GITHUB_ISSUES_TOKEN' server.js
+          grep -q 'BUG_REPORT_MAX_PER_WINDOW = 5' server.js
+          grep -q 'version: "9.4.47"' server.js
+      - name: Smoke test backend without GitHub token
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=3100 node server.js >/tmp/jobbubble-v947.log 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 10); do
+            curl -fsS http://127.0.0.1:3100/health >/tmp/health.json && break
+            sleep 1
+          done
+          grep -q '"version":"9.4.47"' /tmp/health.json
+          grep -q '"github_bug_reporting":"needs_token"' /tmp/health.json
+          STATUS=$(curl -sS -o /tmp/report.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:3100/report-bug \
+            -H 'Content-Type: application/json' \
+            --data '{"description":"Test report from CI","app_version":"9.4.47","android_version":"test","device_model":"CI","screen":"Help & Support"}')
+          test "$STATUS" = "503"
+          grep -q 'temporarily unavailable' /tmp/report.json
+          STATUS=$(curl -sS -o /tmp/invalid.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:3100/report-bug \
+            -H 'Content-Type: application/json' \
+            --data '{"description":"x"}')
+          test "$STATUS" = "400"
+          OPTIONS=$(curl -sSI -X OPTIONS http://127.0.0.1:3100/report-bug | tr -d '\r')
+          echo "$OPTIONS" | grep -q 'Access-Control-Allow-Methods: GET,POST,OPTIONS'
+      - name: Commit patched server
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git diff --cached --quiet && exit 0
+          git commit -m "Add secure in-app GitHub bug reporting endpoint [skip ci]"
+          git push
