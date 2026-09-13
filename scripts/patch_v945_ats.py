@@ -3,6 +3,16 @@ from pathlib import Path
 p = Path("server.js")
 s = p.read_text()
 
+# The workflow also runs when the ATS provider registry changes. Once server.js is
+# already integrated, exit cleanly instead of trying to apply the one-time patch again.
+if (
+    'const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");' in s
+    and 'version: "9.4.45"' in s
+    and 'source === "all" || source === "ats"' in s
+):
+    print("JobBubble backend V9.4.45 ATS integration already present")
+    raise SystemExit(0)
+
 
 def replace_once(old, new, label):
     global s
