@@ -13,6 +13,7 @@ const CAREERONESTOP_API_TOKEN = process.env.CAREERONESTOP_API_TOKEN;
 const THE_MUSE_API_KEY = process.env.THE_MUSE_API_KEY;
 const { fetchCareerOneStopJobs, normalizeCareerOneStopJob } = require("./providers/careeronestop");
 const { fetchMuseJobs, normalizeMuseJob } = require("./providers/themuse");
+const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");
 
 // Geo results barely change, so keep them for a week.
 const GEO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1073,6 +1074,7 @@ function normalizeSource(value) {
   if (x === "adzuna") return "adzuna";
   if (x === "usajobs" || x === "usa jobs" || x === "usa_jobs") return "usajobs";
   if (x === "themuse" || x === "the muse" || x === "muse") return "themuse";
+  if (x === "ats" || x === "greenhouse" || x === "lever" || x === "ashby") return "ats";
   if (x === "careeronestop" || x === "career one stop" || x === "career_one_stop" || x === "nlx") return "careeronestop";
   return "all";
 }
@@ -1116,6 +1118,13 @@ async function fetchSelectedProviders(source, where, radius, query, centerLat, c
       ? `${centerLat},${centerLon}` : where;
     tasks.push(fetchTheMuse(museWhere, radius, query));
   }
+  if (source === "all" || source === "ats") {
+    labels.push("ATS");
+    tasks.push(fetchAtsJobs({
+      query,
+      signal: AbortSignal.timeout(12000)
+    }));
+  }
   // CareerOneStop is preserved for possible future reactivation, but intentionally
   // excluded from the public All Sources path.
   if (source === "careeronestop") {
@@ -1147,7 +1156,8 @@ async function resolveMuseAreaLocations(jobs, origin) {
   // slower workplace/address enrichment has not finished yet.
   const groups = new Map();
   for (const job of jobs) {
-    if (job?.source !== "The Muse" || validCoordinate(job.latitude, job.longitude)) continue;
+    const textOnlySource = job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/");
+    if (!textOnlySource || validCoordinate(job.latitude, job.longitude)) continue;
     const location = String(job.location || "").trim();
     if (!location || /\b(remote|anywhere|multiple locations)\b/i.test(location)) continue;
     const key = location.toLowerCase();
@@ -1166,21 +1176,24 @@ async function resolveMuseAreaLocations(jobs, origin) {
       job.location_precision = "area";
       job.location_approximate = true;
       job.location_confidence = "low";
-      job.location_match_provider = "The Muse/Geoapify area";
+      job.location_match_provider = job.source === "The Muse"
+        ? "The Muse/Geoapify area" : `${job.source}/Geoapify area`;
     }
   });
 
   const requestedCity = String(origin?.label || "").split(",")[0].trim().toLowerCase();
   if (requestedCity && validCoordinate(origin?.latitude, origin?.longitude)) {
     for (const job of jobs) {
-      if (job?.source !== "The Muse" || validCoordinate(job.latitude, job.longitude)) continue;
+      const textOnlySource = job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/");
+    if (!textOnlySource || validCoordinate(job.latitude, job.longitude)) continue;
       if (String(job.location || "").toLowerCase().includes(requestedCity)) {
         job.latitude = origin.latitude;
         job.longitude = origin.longitude;
         job.location_precision = "area";
         job.location_approximate = true;
         job.location_confidence = "low";
-        job.location_match_provider = "The Muse search area";
+        job.location_match_provider = job.source === "The Muse"
+          ? "The Muse search area" : `${job.source} search area`;
       }
     }
   }
@@ -1217,6 +1230,8 @@ async function buildSearch(params, cacheKey) {
         }
       }
       normalized.push(...museJobs);
+    } else if (provider.label === "ATS") {
+      normalized.push(...provider.value);
     } else if (provider.label === "CareerOneStop/NLx") {
       normalized.push(...provider.value.map(normalizeCareerOneStopJob));
     }
@@ -1225,7 +1240,10 @@ async function buildSearch(params, cacheKey) {
   // Muse jobs arrive without coordinates. Resolve their provider-supplied area labels
   // before the quick response is finalized; otherwise finalizeJobs drops them and the
   // app can misleadingly show only the one posting that happened to resolve quickly.
-  if (normalized.some((job) => job?.source === "The Muse" && !validCoordinate(job.latitude, job.longitude))) {
+  if (normalized.some((job) =>
+    (job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/")) &&
+    !validCoordinate(job.latitude, job.longitude)
+  )) {
     await resolveMuseAreaLocations(normalized, origin);
   }
 
@@ -1403,17 +1421,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.44" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.45" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.44",
+        version: "9.4.45",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
         themuse: THE_MUSE_API_KEY ? "enabled" : "disabled",
+        ats: "enabled",
+        ats_boards: getAtsBoards().length,
         careeronestop: "hidden",
         job_cache_entries: jobCache.size,
         geo_cache_entries: geoCache.size,
@@ -1438,11 +1458,12 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.44 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.45 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
   console.log("The Muse:", THE_MUSE_API_KEY ? "enabled" : "disabled");
+  console.log("ATS feeds:", `${getAtsBoards().length} employer boards configured`);
   console.log("CareerOneStop: hidden from public source selection");
   console.log("Fast search cache: enabled");
   console.log("Firestore workplace cache:", firestoreEnabled ? "enabled" : "disabled");
