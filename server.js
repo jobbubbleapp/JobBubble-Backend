@@ -8,14 +8,11 @@ const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
 const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
 const USAJOBS_API_KEY = process.env.USAJOBS_API_KEY;
 const USAJOBS_EMAIL = process.env.USAJOBS_EMAIL;
-const CAREERONESTOP_USER_ID = process.env.CAREERONESTOP_USER_ID;
-const CAREERONESTOP_API_TOKEN = process.env.CAREERONESTOP_API_TOKEN;
 const THE_MUSE_API_KEY = process.env.THE_MUSE_API_KEY;
 const GITHUB_ISSUES_TOKEN = process.env.GITHUB_ISSUES_TOKEN;
 const GITHUB_ISSUES_REPO = process.env.GITHUB_ISSUES_REPO || "jobbubbleapp/JobBubbleApp";
 const BUG_REPORT_WINDOW_MS = 10 * 60 * 1000;
 const BUG_REPORT_MAX_PER_WINDOW = 5;
-const { fetchCareerOneStopJobs, normalizeCareerOneStopJob } = require("./providers/careeronestop");
 const { fetchMuseJobs, normalizeMuseJob } = require("./providers/themuse");
 const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");
 
@@ -1223,14 +1220,6 @@ async function fetchUSAJobs(where, radius, query) {
   return Array.isArray(items) ? items : [];
 }
 
-async function fetchCareerOneStop(where, radius, query) {
-  return fetchCareerOneStopJobs({
-    userId: CAREERONESTOP_USER_ID,
-    apiToken: CAREERONESTOP_API_TOKEN,
-    where, radius, query, pageSize: 50, days: 60,
-    signal: AbortSignal.timeout(12000)
-  });
-}
 
 async function fetchTheMuse(where, radius, query) {
   return fetchMuseJobs({
@@ -1249,7 +1238,6 @@ function normalizeSource(value) {
   if (x === "greenhouse") return "greenhouse";
   if (x === "lever") return "lever";
   if (x === "ashby") return "ashby";
-  if (x === "careeronestop" || x === "career one stop" || x === "career_one_stop" || x === "nlx") return "careeronestop";
   return "all";
 }
 
@@ -1300,12 +1288,6 @@ async function fetchSelectedProviders(source, where, radius, query, centerLat, c
       provider: atsProvider,
       signal: AbortSignal.timeout(12000)
     }));
-  }
-  // CareerOneStop is preserved for possible future reactivation, but intentionally
-  // excluded from the public All Sources path.
-  if (source === "careeronestop") {
-    labels.push("CareerOneStop/NLx");
-    tasks.push(fetchCareerOneStop(where, radius, query));
   }
 
   const results = await Promise.allSettled(tasks);
@@ -1420,8 +1402,6 @@ async function buildSearch(params, cacheKey) {
       normalized.push(...museJobs);
     } else if (provider.label === "ATS") {
       normalized.push(...provider.value);
-    } else if (provider.label === "CareerOneStop/NLx") {
-      normalized.push(...provider.value.map(normalizeCareerOneStopJob));
     }
   }
 
@@ -1622,7 +1602,6 @@ const server = http.createServer(async (req, res) => {
         themuse: THE_MUSE_API_KEY ? "enabled" : "disabled",
         ats: "enabled",
         ats_boards: getAtsBoards().length,
-        careeronestop: "hidden",
         job_cache_entries: jobCache.size,
         geo_cache_entries: geoCache.size,
         workplace_cache_entries: workplaceCache.size,
@@ -1658,7 +1637,6 @@ server.listen(PORT, () => {
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
   console.log("The Muse:", THE_MUSE_API_KEY ? "enabled" : "disabled");
   console.log("ATS feeds:", `${getAtsBoards().length} employer boards configured`);
-  console.log("CareerOneStop: hidden from public source selection");
   console.log("Fast search cache: enabled");
   console.log("Firestore workplace cache:", firestoreEnabled ? "enabled" : "disabled");
   console.log("Firestore cache policy: high-confidence-only");
