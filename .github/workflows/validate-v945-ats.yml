@@ -1,0 +1,53 @@
+name: Validate V9.4.45 ATS feeds
+
+on:
+  push:
+    branches:
+      - feature/ats-feeds
+    paths:
+      - '.github/workflows/validate-v945-ats.yml'
+      - 'providers/ats.js'
+      - 'server.js'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Validate syntax
+        run: |
+          node --check server.js
+          node --check providers/ats.js
+      - name: Fetch live public ATS jobs
+        run: |
+          node - <<'NODE'
+          const { fetchAtsJobs, getAtsBoards } = require('./providers/ats');
+
+          (async () => {
+            const boards = getAtsBoards();
+            const jobs = await fetchAtsJobs({ signal: AbortSignal.timeout(30000) });
+            if (!jobs.length) throw new Error('Public ATS feeds returned zero jobs');
+
+            const sources = new Set(jobs.map(job => job.source));
+            const expected = ['ATS/Greenhouse', 'ATS/Lever', 'ATS/Ashby'];
+            const missing = expected.filter(source => !sources.has(source));
+            if (missing.length) {
+              throw new Error(`No live jobs returned for: ${missing.join(', ')}`);
+            }
+
+            const bad = jobs.find(job => !job.id || !job.title || !job.company || !job.apply_url);
+            if (bad) throw new Error(`Malformed ATS job: ${JSON.stringify(bad).slice(0, 500)}`);
+
+            console.log(`Live ATS validation passed: ${jobs.length} jobs from ${boards.length} boards`);
+            console.log(`Sources: ${Array.from(sources).join(', ')}`);
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
