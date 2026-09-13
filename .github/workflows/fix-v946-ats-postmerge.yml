@@ -1,0 +1,62 @@
+name: Fix and validate V9.4.46 ATS post-merge issues
+
+on:
+  push:
+    branches:
+      - fix/ats-postmerge-check
+    paths:
+      - 'scripts/patch_v946_ats_postmerge.py'
+      - '.github/workflows/fix-v946-ats-postmerge.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Apply post-merge ATS patch
+        run: python3 scripts/patch_v946_ats_postmerge.py
+      - name: Validate syntax
+        run: |
+          node --check server.js
+          node --check providers/ats.js
+      - name: Validate ATS provider filtering and live feeds
+        run: |
+          node - <<'NODE'
+          const { fetchAtsJobs } = require('./providers/ats');
+          (async () => {
+            const all = await fetchAtsJobs({ signal: AbortSignal.timeout(30000) });
+            if (!all.length) throw new Error('ATS feeds returned zero jobs');
+            for (const provider of ['greenhouse', 'lever', 'ashby']) {
+              const jobs = await fetchAtsJobs({ provider, signal: AbortSignal.timeout(30000) });
+              if (!jobs.length) throw new Error(`${provider} returned zero jobs`);
+              if (jobs.some(job => job.ats_provider !== provider)) {
+                throw new Error(`${provider} source filter leaked jobs from another ATS`);
+              }
+            }
+            console.log(`ATS live/provider filtering validation passed with ${all.length} total jobs`);
+          })().catch(error => { console.error(error); process.exit(1); });
+          NODE
+      - name: Validate safety cap and version wiring
+        run: |
+          grep -q 'MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH = 24' server.js
+          grep -q 'version: "9.4.46"' server.js
+          grep -q 'return "greenhouse"' server.js
+          grep -q 'return "lever"' server.js
+          grep -q 'return "ashby"' server.js
+      - name: Commit patched files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js providers/ats.js
+          git diff --cached --quiet && exit 0
+          git commit -m "Fix ATS source filtering and bound location geocoding [skip ci]"
+          git push
