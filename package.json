@@ -4,7 +4,8 @@
   "description": "JobBubble job provider API",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check providers/ats.js && node --check providers/themuse.js"
   },
   "engines": {
     "node": ">=18"

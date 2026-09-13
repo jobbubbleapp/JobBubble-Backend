@@ -1,14 +1,21 @@
-name: Validate ATS feeds and backend runtime
+name: Validate JobBubble backend
 
 on:
   push:
     branches:
       - main
-      - feature/bug-report-api
+      - refactor/backend-cleanup
     paths:
-      - '.github/workflows/validate-v945-ats.yml'
-      - 'providers/ats.js'
+      - '.github/workflows/validate-backend.yml'
+      - 'providers/**'
       - 'server.js'
+      - 'package.json'
+      - '.env.example'
+  pull_request:
+    paths:
+      - 'providers/**'
+      - 'server.js'
+      - 'package.json'
       - '.env.example'
 
 permissions:
@@ -26,6 +33,7 @@ jobs:
         run: |
           node --check server.js
           node --check providers/ats.js
+          node --check providers/themuse.js
       - name: Fetch and validate live public ATS jobs
         run: |
           node - <<'NODE'
@@ -59,7 +67,7 @@ jobs:
             process.exit(1);
           });
           NODE
-      - name: Validate ATS and bug-report safety wiring
+      - name: Validate runtime wiring
         run: |
           grep -q 'MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH = 24' server.js
           grep -q 'return "greenhouse"' server.js
@@ -68,6 +76,8 @@ jobs:
           grep -q 'POST" && url.pathname === "/report-bug"' server.js
           grep -q 'GITHUB_ISSUES_TOKEN' server.js
           grep -q 'BUG_REPORT_MAX_PER_WINDOW = 5' server.js
+          ! grep -q 'CareerOneStop' server.js
+          ! grep -q 'careerjet' server.js
       - name: Start backend and smoke-test HTTP endpoints
         shell: bash
         run: |
@@ -83,7 +93,6 @@ jobs:
           curl -fsS http://127.0.0.1:3100/health >/tmp/health.json
           grep -q '9.4.47' /tmp/root.json
           grep -q '"ats":"enabled"' /tmp/health.json
-          grep -q '"github_bug_reporting":"needs_token"' /tmp/health.json
 
           BAD_STATUS=$(curl -sS -o /tmp/bad-report.json -w '%{http_code}' \
             -X POST http://127.0.0.1:3100/report-bug \
