@@ -1,8 +1,15 @@
-name: Step 9 Backend Unit Tests
+name: Backend Unit Tests
 
 on:
   push:
-    branches: [feature/step9-cleanup-testing]
+    branches: [main, feature/step9-cleanup-testing]
+    paths:
+      - 'providers/**'
+      - 'test/**'
+      - 'package.json'
+      - '.github/workflows/step9-backend-tests.yml'
+  pull_request:
+    branches: [main]
     paths:
       - 'providers/**'
       - 'test/**'
