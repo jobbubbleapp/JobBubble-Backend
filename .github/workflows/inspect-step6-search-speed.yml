@@ -2,7 +2,7 @@ name: Inspect Step 6 Search Speed
 
 on:
   push:
-    branches: [main]
+    branches: [feature/step6-search-speed]
     paths:
       - '.github/workflows/inspect-step6-search-speed.yml'
 
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Benchmark production provider and all-source searches
+      - name: Benchmark stable production provider and all-source searches
         shell: bash
         run: |
           set -euo pipefail
@@ -22,28 +22,34 @@ jobs:
           : > /tmp/results.txt
           for source in adzuna usajobs themuse ats all; do
             OUT="/tmp/${source}.json"
-            METRICS=$(curl -fsS --max-time 50 -o "$OUT" -w '%{time_starttransfer} %{time_total}' "$BASE&source=$source")
+            METRICS=$(curl -sS --max-time 50 -o "$OUT" -w '%{http_code} %{time_starttransfer} %{time_total}' "$BASE&source=$source" || true)
             COUNT=$(python3 - "$OUT" <<'PY'
           import json,sys
-          d=json.load(open(sys.argv[1]))
-          print(len(d.get('jobs',[])), int(bool(d.get('location_refining'))), d.get('cache',''))
+          try:
+              d=json.load(open(sys.argv[1]))
+          except Exception:
+              print('invalid-json -1 -'); raise SystemExit(0)
+          print(len(d.get('jobs',[])) if isinstance(d.get('jobs'),list) else -1, int(bool(d.get('location_refining'))), d.get('cache',''))
           PY
           )
             echo "$source $METRICS $COUNT" | tee -a /tmp/results.txt
           done
           echo '--- cache-hit repeat for all ---' | tee -a /tmp/results.txt
           OUT=/tmp/all-hit.json
-          METRICS=$(curl -fsS --max-time 30 -o "$OUT" -w '%{time_starttransfer} %{time_total}' 'https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&refined=0&source=all')
+          METRICS=$(curl -sS --max-time 30 -o "$OUT" -w '%{http_code} %{time_starttransfer} %{time_total}' 'https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&refined=0&source=all' || true)
           COUNT=$(python3 - "$OUT" <<'PY'
           import json,sys
-          d=json.load(open(sys.argv[1])); print(len(d.get('jobs',[])), int(bool(d.get('location_refining'))), d.get('cache',''))
+          try: d=json.load(open(sys.argv[1]))
+          except Exception: print('invalid-json -1 -'); raise SystemExit(0)
+          print(len(d.get('jobs',[])) if isinstance(d.get('jobs'),list) else -1, int(bool(d.get('location_refining'))), d.get('cache',''))
           PY
           )
           echo "all-hit $METRICS $COUNT" | tee -a /tmp/results.txt
+          cat /tmp/results.txt
 
       - name: Upload benchmark
         uses: actions/upload-artifact@v4
         with:
-          name: step6-search-speed-baseline
+          name: step6-search-speed-baseline-stable
           path: /tmp/results.txt
           retention-days: 3
