@@ -31,12 +31,14 @@ test("The Muse free-text search filters and deduplicates provider pages", async 
     const url = new URL(String(input));
     requests.push(url);
     return new Response(JSON.stringify({ results: [
-      { id: 1, name: "Customer Support Associate", company: { name: "Acme" }, categories: [{ name: "Customer Service" }], levels: [{ name: "Entry Level" }], contents: "Deliver excellent service to customers", locations: [{ name: "Seattle, WA" }], refs: { landing_page: "https://x/1" } },
+      { id: 1, name: "Customer Support Associate", company: { name: "Acme" }, categories: [{ name: "Customer Service" }], levels: [{ name: "Entry Level" }], contents: "Deliver excellent support to customers", locations: [{ name: "Seattle, WA" }], refs: { landing_page: "https://x/1" } },
       { id: 2, name: "Software Engineer", company: { name: "Acme" }, categories: [{ name: "Software Engineering" }], contents: "Build APIs", locations: [{ name: "Seattle, WA" }], refs: { landing_page: "https://x/2" } }
     ] }), { status: 200, headers: { "content-type": "application/json" } });
   };
   try {
-    const jobs = await fetchMuseJobs({ apiKey: "test-key", where: "Seattle, WA", query: "customer service" });
+    // "customer support" is intentionally not one of The Muse's official category names,
+    // so this exercises JobBubble's free-text post-filter rather than provider categories.
+    const jobs = await fetchMuseJobs({ apiKey: "test-key", where: "Seattle, WA", query: "customer support" });
     assert.equal(jobs.length, 1);
     assert.equal(jobs[0].id, 1);
     assert.equal(requests.length, 5);
