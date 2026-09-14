@@ -12,6 +12,7 @@ on:
       - 'bootstrap.js'
       - 'bootstrap-fast.js'
       - 'render-preload.js'
+      - 'materialize-runtime.js'
       - 'package.json'
       - '.env.example'
   pull_request:
@@ -21,6 +22,7 @@ on:
       - 'bootstrap.js'
       - 'bootstrap-fast.js'
       - 'render-preload.js'
+      - 'materialize-runtime.js'
       - 'package.json'
       - '.env.example'
 
@@ -35,15 +37,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Validate syntax and GeoCache V2 transformation
+      - name: Validate syntax and GeoCache V2 runtime
         run: |
+          set -euo pipefail
           node --check server.js
-          node --check bootstrap.js
-          node --check bootstrap-fast.js
-          node --check render-preload.js
-          node bootstrap-fast.js --check
           node --check providers/ats.js
           node --check providers/themuse.js
+          if grep -Fq 'const GEO_CACHE_VERSION = "v2";' server.js; then
+            echo 'Validating materialized GeoCache V2 runtime'
+            grep -Fq 'const geoCache = new SmartGeoCache();' server.js
+            grep -Fq 'setTimeout(resolve, 900)' server.js
+            grep -Fq 'Promise.allSettled([' server.js
+            grep -Fq 'geo_cache_version: GEO_CACHE_VERSION' server.js
+          else
+            echo 'Validating bootstrap-generated GeoCache V2 runtime'
+            node --check bootstrap.js
+            node --check bootstrap-fast.js
+            node --check render-preload.js
+            node --check materialize-runtime.js
+            node bootstrap-fast.js --check
+          fi
       - name: Fetch and validate live public ATS jobs
         run: |
           node - <<'NODE'
@@ -79,6 +92,7 @@ jobs:
           NODE
       - name: Validate runtime wiring
         run: |
+          set -euo pipefail
           grep -q 'MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH = 24' server.js
           grep -q 'return "greenhouse"' server.js
           grep -q 'return "lever"' server.js
@@ -86,24 +100,34 @@ jobs:
           grep -q 'POST" && url.pathname === "/report-bug"' server.js
           grep -q 'GITHUB_ISSUES_TOKEN' server.js
           grep -q 'BUG_REPORT_MAX_PER_WINDOW = 5' server.js
-          grep -q 'GEO_CACHE_VERSION = "v2"' bootstrap.js
-          grep -q 'GEO_NEGATIVE_CACHE_TTL_MS = 30 \* 60 \* 1000' bootstrap.js
-          grep -q 'class SmartGeoCache extends Map' bootstrap.js
-          grep -q 'hydrateGeoCacheFromFirestore' bootstrap.js
-          grep -q 'shouldPersistGeoCacheEntry' bootstrap.js
-          grep -q '__jobbubbleGeoFetchDedupeStats' bootstrap.js
-          grep -q 'setTimeout(resolve, 900)' bootstrap-fast.js
-          grep -q 'Promise.allSettled' bootstrap-fast.js
-          grep -q 'bootstrap-fast.js' render-preload.js
-          grep -q 'JobBubble server already started by render-preload.js' render-preload.js
-          grep -q 'node bootstrap-fast.js' package.json
           ! grep -q 'CareerOneStop' server.js
           ! grep -q 'careerjet' server.js
-      - name: Start backend through Render-equivalent preload and smoke-test HTTP endpoints
+          if grep -Fq 'const GEO_CACHE_VERSION = "v2";' server.js; then
+            grep -q 'GEO_NEGATIVE_CACHE_TTL_MS = 30 \* 60 \* 1000' server.js
+            grep -q 'class SmartGeoCache extends Map' server.js
+            grep -q 'hydrateGeoCacheFromFirestore' server.js
+            grep -q 'shouldPersistGeoCacheEntry' server.js
+            grep -q 'setTimeout(resolve, 900)' server.js
+            grep -q 'Promise.allSettled' server.js
+          else
+            grep -q 'GEO_CACHE_VERSION = "v2"' bootstrap.js
+            grep -q 'GEO_NEGATIVE_CACHE_TTL_MS = 30 \* 60 \* 1000' bootstrap.js
+            grep -q 'class SmartGeoCache extends Map' bootstrap.js
+            grep -q 'hydrateGeoCacheFromFirestore' bootstrap.js
+            grep -q 'shouldPersistGeoCacheEntry' bootstrap.js
+            grep -q '__jobbubbleGeoFetchDedupeStats' bootstrap.js
+            grep -q 'setTimeout(resolve, 900)' bootstrap-fast.js
+            grep -q 'Promise.allSettled' bootstrap-fast.js
+          fi
+      - name: Start backend and smoke-test HTTP endpoints
         shell: bash
         run: |
           set -euo pipefail
-          PORT=3100 NODE_OPTIONS='--require ./render-preload.js' node server.js >/tmp/jobbubble-server.log 2>&1 &
+          if grep -Fq 'const GEO_CACHE_VERSION = "v2";' server.js; then
+            PORT=3100 node server.js >/tmp/jobbubble-server.log 2>&1 &
+          else
+            PORT=3100 NODE_OPTIONS='--require ./render-preload.js' node server.js >/tmp/jobbubble-server.log 2>&1 &
+          fi
           PID=$!
           trap 'kill $PID 2>/dev/null || true' EXIT
           for i in 1 2 3 4 5 6 7 8 9 10; do
