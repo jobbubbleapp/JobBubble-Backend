@@ -1330,7 +1330,7 @@ function normalizeAdzunaJob(item) {
 async function enrichJobLocation(job) {
   if (!job) return job;
 
-  // V9.4.49: a street address in provider text is strong evidence, but the provider
+  // V9.4.50: a street address in provider text is strong evidence, but the provider
   // coordinate beside it can still be only a city/area centroid. Geocode the address
   // itself before calling the map pin exact. If verification is unavailable or fails,
   // keep the provider coordinate as an approximate fallback instead of dropping the job.
@@ -2010,13 +2010,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.49" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.50" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.49",
+        version: "9.4.50",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -2066,7 +2066,7 @@ hydrateGeoCacheFromFirestore().catch((error) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.49 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.50 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");

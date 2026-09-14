@@ -237,7 +237,11 @@ async function fetchGreenhouseBoard(board, signal) {
 
 async function fetchLeverBoard(board, signal) {
   const jobs = [];
-  const pageSize = 100;
+  // V9.4.50: Lever accepts up to 1,000 postings in one public-API response. The
+  // previous 100-item page size forced large hourly-job boards through as many as
+  // ten sequential round trips and could hit the shared 12-second provider timeout.
+  // Keep the existing 1,000-job safety cap, but request the whole capped set at once.
+  const pageSize = 1000;
   let skip = 0;
 
   // Cap each board so a misconfigured feed cannot monopolize a JobBubble search.
