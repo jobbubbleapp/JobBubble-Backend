@@ -11,6 +11,7 @@ on:
       - 'server.js'
       - 'bootstrap.js'
       - 'bootstrap-fast.js'
+      - 'render-preload.js'
       - 'package.json'
       - '.env.example'
   pull_request:
@@ -19,6 +20,7 @@ on:
       - 'server.js'
       - 'bootstrap.js'
       - 'bootstrap-fast.js'
+      - 'render-preload.js'
       - 'package.json'
       - '.env.example'
 
@@ -38,6 +40,7 @@ jobs:
           node --check server.js
           node --check bootstrap.js
           node --check bootstrap-fast.js
+          node --check render-preload.js
           node bootstrap-fast.js --check
           node --check providers/ats.js
           node --check providers/themuse.js
@@ -91,14 +94,16 @@ jobs:
           grep -q '__jobbubbleGeoFetchDedupeStats' bootstrap.js
           grep -q 'setTimeout(resolve, 900)' bootstrap-fast.js
           grep -q 'Promise.allSettled' bootstrap-fast.js
+          grep -q 'bootstrap-fast.js' render-preload.js
+          grep -q 'JobBubble server already started by render-preload.js' render-preload.js
           grep -q 'node bootstrap-fast.js' package.json
           ! grep -q 'CareerOneStop' server.js
           ! grep -q 'careerjet' server.js
-      - name: Start backend and smoke-test HTTP endpoints
+      - name: Start backend through Render-equivalent preload and smoke-test HTTP endpoints
         shell: bash
         run: |
           set -euo pipefail
-          PORT=3100 node bootstrap-fast.js >/tmp/jobbubble-server.log 2>&1 &
+          PORT=3100 NODE_OPTIONS='--require ./render-preload.js' node server.js >/tmp/jobbubble-server.log 2>&1 &
           PID=$!
           trap 'kill $PID 2>/dev/null || true' EXIT
           for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -111,6 +116,7 @@ jobs:
           grep -q '"ats":"enabled"' /tmp/health.json
           grep -q '"geo_cache_version":"v2"' /tmp/health.json
           grep -q '"firestore_geo_cache":"disabled"' /tmp/health.json
+          grep -q 'GeoCache V2:' /tmp/jobbubble-server.log
 
           BAD_STATUS=$(curl -sS -o /tmp/bad-report.json -w '%{http_code}' \
             -X POST http://127.0.0.1:3100/report-bug \
