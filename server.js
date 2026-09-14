@@ -1467,6 +1467,26 @@ function finalizeJobs(jobs, origin, radius) {
   return deduped;
 }
 
+function minimumHourlyPay(job) {
+  const amount = Number(job?.salary_min);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const period = String(job?.salary_period || '').trim().toLowerCase();
+  if (period === 'year') return amount / 2080;
+  if (period === 'month') return amount * 12 / 2080;
+  if (period === 'week') return amount * 52 / 2080;
+  if (period === 'day') return amount / 8;
+  return amount;
+}
+
+function matchesMinimumPay(job, minPayHourly) {
+  if (!Number.isFinite(minPayHourly) || minPayHourly <= 0) return true;
+  const hourly = minimumHourlyPay(job);
+  // Keep jobs with unknown/unparseable salary, matching the Android client's
+  // long-standing behavior. Only a known advertised minimum below the user's
+  // threshold is removed.
+  return hourly == null || hourly >= minPayHourly;
+}
+
 async function runWithConcurrency(items, limit, worker) {
   let index = 0;
   const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -1483,27 +1503,60 @@ async function runWithConcurrency(items, limit, worker) {
   await Promise.all(runners);
 }
 
-async function fetchAdzunaJobs(where, radius, query) {
+async function fetchAdzunaJobs(where, radius, query, minPayHourly = 0) {
   if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) {
     throw new Error("Adzuna environment variables are missing");
   }
 
-  const url = new URL("https://api.adzuna.com/v1/api/jobs/us/search/1");
-  url.searchParams.set("app_id", ADZUNA_APP_ID);
-  url.searchParams.set("app_key", ADZUNA_APP_KEY);
-  url.searchParams.set("results_per_page", "50");
-  if (where) url.searchParams.set("where", where);
-  if (query) url.searchParams.set("what", query);
-  if (radius > 0) url.searchParams.set("distance", String(radius));
-  url.searchParams.set("content-type", "application/json");
+  const makeUrl = (salaryMinAnnual = null) => {
+    const url = new URL("https://api.adzuna.com/v1/api/jobs/us/search/1");
+    url.searchParams.set("app_id", ADZUNA_APP_ID);
+    url.searchParams.set("app_key", ADZUNA_APP_KEY);
+    url.searchParams.set("results_per_page", "50");
+    if (where) url.searchParams.set("where", where);
+    if (query) url.searchParams.set("what", query);
+    if (radius > 0) url.searchParams.set("distance", String(radius));
+    if (Number.isFinite(salaryMinAnnual) && salaryMinAnnual > 0) {
+      url.searchParams.set("salary_min", String(Math.round(salaryMinAnnual)));
+    }
+    url.searchParams.set("content-type", "application/json");
+    return url;
+  };
 
-  const response = await fetch(url, { signal: AbortSignal.timeout(12000) });
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Adzuna HTTP ${response.status}: ${body.slice(0, 200)}`);
+  const requestPage = async (url) => {
+    const response = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Adzuna HTTP ${response.status}: ${body.slice(0, 200)}`);
+    }
+    const data = await response.json();
+    return Array.isArray(data.results) ? data.results : [];
+  };
+
+  const basePromise = requestPage(makeUrl());
+  if (!Number.isFinite(minPayHourly) || minPayHourly <= 0) return basePromise;
+
+  // Keep the ordinary page so salary-unknown listings are never lost. In parallel,
+  // ask Adzuna for a salary-targeted page and merge it in. Adzuna's salary_min is
+  // annual, while JobBubble's control is hourly, so use the same 2080 h/year
+  // conversion as the Android app.
+  const targetedPromise = requestPage(makeUrl(minPayHourly * 2080));
+  const [base, targeted] = await Promise.allSettled([basePromise, targetedPromise]);
+  if (base.status !== "fulfilled") throw base.reason;
+
+  const merged = base.value.slice();
+  const seen = new Set(merged.map((item) => String(item?.id || "")).filter(Boolean));
+  if (targeted.status === "fulfilled") {
+    for (const item of targeted.value) {
+      const id = String(item?.id || "");
+      if (id && seen.has(id)) continue;
+      if (id) seen.add(id);
+      merged.push(item);
+    }
+  } else {
+    console.error("Adzuna salary-targeted request failed:", targeted.reason?.message || targeted.reason);
   }
-  const data = await response.json();
-  return Array.isArray(data.results) ? data.results : [];
+  return merged;
 }
 
 async function fetchUSAJobs(where, radius, query) {
@@ -1558,7 +1611,7 @@ function normalizeSource(value) {
   return "all";
 }
 
-function makeSearchKey({ where, radius, query, source, centerLat, centerLon }) {
+function makeSearchKey({ where, radius, query, source, centerLat, centerLon, minPayHourly }) {
   const latKey = Number.isFinite(centerLat) ? centerLat.toFixed(4) : "";
   const lonKey = Number.isFinite(centerLon) ? centerLon.toFixed(4) : "";
   return [
@@ -1567,7 +1620,8 @@ function makeSearchKey({ where, radius, query, source, centerLat, centerLon }) {
     String(query || "").toLowerCase().trim(),
     source,
     latKey,
-    lonKey
+    lonKey,
+    Number.isFinite(minPayHourly) ? Number(minPayHourly).toFixed(2) : "0.00"
   ].join("|");
 }
 
@@ -1579,13 +1633,13 @@ function cloneResponse(value, overrides = {}) {
   };
 }
 
-async function fetchSelectedProviders(source, where, radius, query, centerLat, centerLon) {
+async function fetchSelectedProviders(source, where, radius, query, centerLat, centerLon, minPayHourly) {
   const tasks = [];
   const labels = [];
 
   if (source === "all" || source === "adzuna") {
     labels.push("Adzuna");
-    tasks.push(fetchAdzunaJobs(where, radius, query));
+    tasks.push(fetchAdzunaJobs(where, radius, query, minPayHourly));
   }
   if (source === "all" || source === "usajobs") {
     labels.push("USAJOBS");
@@ -1687,11 +1741,11 @@ async function resolveMuseAreaLocations(jobs, origin) {
 }
 
 async function buildSearch(params, cacheKey) {
-  const { where, radius, query, source, centerLat, centerLon } = params;
+  const { where, radius, query, source, centerLat, centerLon, minPayHourly } = params;
   const origin = await geoapifySearchOrigin(where, centerLat, centerLon);
   if (!origin) throw new Error("Could not resolve the requested search location.");
 
-  const providerResults = await fetchSelectedProviders(source, where, radius, query, origin.latitude, origin.longitude);
+  const providerResults = await fetchSelectedProviders(source, where, radius, query, origin.latitude, origin.longitude, minPayHourly);
   const normalized = [];
 
   for (const provider of providerResults) {
@@ -1722,15 +1776,21 @@ async function buildSearch(params, cacheKey) {
     }
   }
 
+  // Apply the same minimum-pay semantics as Android before location enrichment:
+  // known advertised minimums below the threshold are excluded, while unknown pay
+  // remains eligible. The Adzuna companion search above widens the candidate pool so
+  // high-paying jobs are not hidden behind the ordinary 50-result provider page.
+  const payEligible = normalized.filter((job) => matchesMinimumPay(job, minPayHourly));
+
   // Muse jobs arrive without coordinates. Resolve their provider-supplied area labels
   // before the quick response is finalized; otherwise finalizeJobs drops them and the
   // app can misleadingly show only the one posting that happened to resolve quickly.
   let areaResolutionPromise = Promise.resolve();
-  if (normalized.some((job) =>
+  if (payEligible.some((job) =>
     (job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/")) &&
     !validCoordinate(job.latitude, job.longitude)
   )) {
-    areaResolutionPromise = resolveMuseAreaLocations(normalized, origin)
+    areaResolutionPromise = resolveMuseAreaLocations(payEligible, origin)
       .catch((error) => console.error("Background text-location refinement failed:", error.message));
     // Exact-city anchors are assigned synchronously inside resolveMuseAreaLocations.
     // Give nearby text locations a brief chance to resolve, then return usable jobs
@@ -1745,7 +1805,7 @@ async function buildSearch(params, cacheKey) {
   // the cost of Geoapify refinement. Keep a small margin because refinement can move
   // an area-level pin closer to the actual workplace.
   const candidates = [];
-  for (const job of normalized) {
+  for (const job of payEligible) {
     if (!validCoordinate(job.latitude, job.longitude)) {
       // Keep coordinate-less postings long enough for description/ATS address
       // extraction to rescue them during enrichment.
@@ -1780,6 +1840,7 @@ async function buildSearch(params, cacheKey) {
       search_longitude: origin.longitude,
       radius_miles: radius,
       source_filter: source,
+      min_pay_hourly: minPayHourly,
       location_refining: false,
       jobs: refinedJobs
     };
@@ -1804,6 +1865,7 @@ async function buildSearch(params, cacheKey) {
     search_longitude: origin.longitude,
     radius_miles: radius,
     source_filter: source,
+    min_pay_hourly: minPayHourly,
     location_refining: true,
     jobs: fastJobs
   };
@@ -1837,10 +1899,13 @@ async function handleJobs(req, res, url) {
     const centerLat = Number(url.searchParams.get("lat"));
     const centerLon = Number(url.searchParams.get("lon"));
     const source = normalizeSource(url.searchParams.get("source"));
+    const requestedMinPay = Number(url.searchParams.get("min_pay_hourly") || 0);
+    const minPayHourly = Number.isFinite(requestedMinPay) && requestedMinPay > 0
+      ? Math.min(requestedMinPay, 500) : 0;
     const forceRefresh = url.searchParams.get("refresh") === "1";
     const refined = url.searchParams.get("refined") === "1";
 
-    const params = { where, radius, query, source, centerLat, centerLon };
+    const params = { where, radius, query, source, centerLat, centerLon, minPayHourly };
     const cacheKey = makeSearchKey(params);
     const cached = jobCache.get(cacheKey);
     const age = cached ? Date.now() - cached.time : Infinity;
@@ -1919,13 +1984,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.47" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.48" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.47",
+        version: "9.4.48",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -1975,7 +2040,7 @@ hydrateGeoCacheFromFirestore().catch((error) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.47 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.48 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
