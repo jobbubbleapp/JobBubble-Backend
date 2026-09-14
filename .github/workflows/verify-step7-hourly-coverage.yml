@@ -1,0 +1,97 @@
+name: Verify Step 7 Hourly Coverage
+
+on:
+  push:
+    branches: [feature/step7-hourly-coverage]
+    paths:
+      - 'scripts/step7-hourly-coverage.js'
+      - '.github/workflows/verify-step7-hourly-coverage.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/step7-hourly-coverage
+          fetch-depth: 0
+
+      - name: Apply Step 7 runtime patch
+        run: node scripts/step7-hourly-coverage.js
+
+      - name: Static validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          node --check providers/ats.js
+          git diff --check
+          grep -Fq 'board: "gopuff"' providers/ats.js
+          grep -Fq 'board: "bluebottlecoffee"' providers/ats.js
+          grep -Fq 'board: "thuma"' providers/ats.js
+          grep -Fq 'function hourlyCategoryMatch(job, query)' providers/ats.js
+          grep -Fq 'JobBubble backend V9.4.51 listening' server.js
+
+      - name: Verify live ATS coverage, category filters, and Step 6 speed
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'JS'
+          const assert = require('assert');
+          const { performance } = require('perf_hooks');
+          const { getAtsBoards, fetchAtsJobs } = require('./providers/ats');
+
+          (async()=>{
+            const boards=getAtsBoards();
+            assert.equal(boards.length,13,`expected 13 default boards, got ${boards.length}`);
+            for (const name of ['gopuff','bluebottlecoffee','thuma']) {
+              assert(boards.some(b=>b.board.toLowerCase()===name),`missing board ${name}`);
+            }
+
+            const started=performance.now();
+            const all=await fetchAtsJobs({signal:AbortSignal.timeout(12000)});
+            const seconds=(performance.now()-started)/1000;
+            assert(all.length>=2500,`expected broad ATS feed after Step 7; got ${all.length}`);
+            assert(seconds<10,`ATS feed regressed Step 6 speed: ${seconds.toFixed(3)}s`);
+
+            const byBoard=(name)=>all.filter(j=>String(j.ats_board||'').toLowerCase()===name);
+            assert(byBoard('gopuff').length>=500,`Gopuff feed unexpectedly small: ${byBoard('gopuff').length}`);
+            assert(byBoard('bluebottlecoffee').length>=30,`Blue Bottle feed unexpectedly small: ${byBoard('bluebottlecoffee').length}`);
+            assert(byBoard('thuma').length>=10,`Thuma feed unexpectedly small: ${byBoard('thuma').length}`);
+
+            const retail=await fetchAtsJobs({query:'retail',signal:AbortSignal.timeout(3000)});
+            const warehouse=await fetchAtsJobs({query:'warehouse',signal:AbortSignal.timeout(3000)});
+            const restaurant=await fetchAtsJobs({query:'restaurant',signal:AbortSignal.timeout(3000)});
+            const barista=await fetchAtsJobs({query:'barista',signal:AbortSignal.timeout(3000)});
+
+            assert(retail.length>=100,`retail category too narrow: ${retail.length}`);
+            assert(warehouse.length>=10,`warehouse category too narrow: ${warehouse.length}`);
+            assert(restaurant.length>=40,`Food & Hospitality category too narrow: ${restaurant.length}`);
+            assert(barista.length>=20,`barista search too narrow: ${barista.length}`);
+            assert(restaurant.some(j=>String(j.ats_board||'').toLowerCase()==='bluebottlecoffee'), 'Blue Bottle missing from Food & Hospitality expansion');
+            assert(retail.some(j=>String(j.ats_board||'').toLowerCase()==='gopuff'), 'Gopuff missing from retail expansion');
+            assert(warehouse.some(j=>String(j.ats_board||'').toLowerCase()==='gopuff'), 'Gopuff missing from warehouse expansion');
+
+            console.log(`PASS: ${all.length} ATS jobs in ${seconds.toFixed(3)}s`);
+            console.log(`Step 7 board jobs: gopuff=${byBoard('gopuff').length}, bluebottle=${byBoard('bluebottlecoffee').length}, thuma=${byBoard('thuma').length}`);
+            console.log(`Filter counts: retail=${retail.length}, warehouse=${warehouse.length}, restaurant=${restaurant.length}, barista=${barista.length}`);
+          })().catch(e=>{ console.error(e); process.exit(1); });
+          JS
+
+      - name: Commit materialized V9.4.51 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add providers/ats.js server.js
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --cached --quiet; then
+            echo 'Step 7 runtime already materialized'
+            exit 0
+          fi
+          git commit -m 'Materialize Step 7 hourly job coverage'
+          git push origin HEAD:feature/step7-hourly-coverage
