@@ -9,12 +9,14 @@ on:
       - '.github/workflows/validate-backend.yml'
       - 'providers/**'
       - 'server.js'
+      - 'bootstrap.js'
       - 'package.json'
       - '.env.example'
   pull_request:
     paths:
       - 'providers/**'
       - 'server.js'
+      - 'bootstrap.js'
       - 'package.json'
       - '.env.example'
 
@@ -29,9 +31,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Validate syntax
+      - name: Validate syntax and GeoCache V2 transformation
         run: |
           node --check server.js
+          node --check bootstrap.js
+          node bootstrap.js --check
           node --check providers/ats.js
           node --check providers/themuse.js
       - name: Fetch and validate live public ATS jobs
@@ -76,13 +80,19 @@ jobs:
           grep -q 'POST" && url.pathname === "/report-bug"' server.js
           grep -q 'GITHUB_ISSUES_TOKEN' server.js
           grep -q 'BUG_REPORT_MAX_PER_WINDOW = 5' server.js
+          grep -q 'GEO_CACHE_VERSION = "v2"' bootstrap.js
+          grep -q 'GEO_NEGATIVE_CACHE_TTL_MS = 30 \* 60 \* 1000' bootstrap.js
+          grep -q 'class SmartGeoCache extends Map' bootstrap.js
+          grep -q 'hydrateGeoCacheFromFirestore' bootstrap.js
+          grep -q 'shouldPersistGeoCacheEntry' bootstrap.js
+          grep -q '__jobbubbleGeoFetchDedupeStats' bootstrap.js
           ! grep -q 'CareerOneStop' server.js
           ! grep -q 'careerjet' server.js
       - name: Start backend and smoke-test HTTP endpoints
         shell: bash
         run: |
           set -euo pipefail
-          PORT=3100 node server.js >/tmp/jobbubble-server.log 2>&1 &
+          PORT=3100 node bootstrap.js >/tmp/jobbubble-server.log 2>&1 &
           PID=$!
           trap 'kill $PID 2>/dev/null || true' EXIT
           for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -93,6 +103,8 @@ jobs:
           curl -fsS http://127.0.0.1:3100/health >/tmp/health.json
           grep -q '9.4.47' /tmp/root.json
           grep -q '"ats":"enabled"' /tmp/health.json
+          grep -q '"geo_cache_version":"v2"' /tmp/health.json
+          grep -q '"firestore_geo_cache":"disabled"' /tmp/health.json
 
           BAD_STATUS=$(curl -sS -o /tmp/bad-report.json -w '%{http_code}' \
             -X POST http://127.0.0.1:3100/report-bug \
