@@ -30,12 +30,16 @@ if (!ats.includes('function hourlyCategoryMatch(job, query)')) {
 // If an earlier Step 7 test materialized the first matcher revision, tighten it in
 // place rather than leaving description boilerplate in the category match surface.
 ats = ats.replace(
-  'const text = [job?.title, job?.company, job?.category, job?.description]\\n    .join(" ").toLowerCase();',
-  'const text = [job?.title, job?.company, job?.category]\\n    .join(" ").toLowerCase();'
+`  const text = [job?.title, job?.company, job?.category, job?.description]
+    .join(" ").toLowerCase();`,
+`  const text = [job?.title, job?.company, job?.category]
+    .join(" ").toLowerCase();`
 );
 ats = ats.replace(
-  '  // existing filters without changing free-text search behavior.\\n',
-  '  // existing filters without changing free-text search behavior. Keep the matching\\n  // to title/company/category fields; full descriptions often contain employer\\n  // boilerplate that would make these category filters much too broad.\\n'
+`  // existing filters without changing free-text search behavior.`,
+`  // existing filters without changing free-text search behavior. Keep the matching
+  // to title/company/category fields; full descriptions often contain employer
+  // boilerplate that would make these category filters much too broad.`
 );
 
 for (const board of ['gopuff','bluebottlecoffee','thuma']) {
