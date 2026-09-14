@@ -1,4 +1,5 @@
 name: Validate JobBubble backend
+# Production server.js is materialized with GeoCache V2 and fast first-response logic.
 
 on:
   push:
@@ -109,6 +110,7 @@ jobs:
             grep -q 'shouldPersistGeoCacheEntry' server.js
             grep -q 'setTimeout(resolve, 900)' server.js
             grep -q 'Promise.allSettled' server.js
+            grep -q 'installMaterializedGeoapifyFetchDedupe' server.js
           else
             grep -q 'GEO_CACHE_VERSION = "v2"' bootstrap.js
             grep -q 'GEO_NEGATIVE_CACHE_TTL_MS = 30 \* 60 \* 1000' bootstrap.js
