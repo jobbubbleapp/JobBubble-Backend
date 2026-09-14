@@ -313,12 +313,14 @@ function tokenMatch(haystack, query) {
 
 function hourlyCategoryMatch(job, query) {
   const key = String(query || "").trim().toLowerCase();
-  const text = [job?.title, job?.company, job?.category, job?.description]
+  const text = [job?.title, job?.company, job?.category]
     .join(" ").toLowerCase();
 
   // The Android category picker intentionally sends compact backend terms. Expand
   // only those exact category terms so hourly employer feeds participate in the
-  // existing filters without changing free-text search behavior.
+  // existing filters without changing free-text search behavior. Keep the matching
+  // to title/company/category fields; full descriptions often contain employer
+  // boilerplate that would make these category filters much too broad.
   if (key === "restaurant") {
     return /\b(restaurant|cafe|coffee|barista|kitchen|cook|food|hospitality|crew|team member)\b/i.test(text);
   }
