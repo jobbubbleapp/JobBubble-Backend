@@ -26,6 +26,7 @@ on:
       - 'materialize-runtime.js'
       - 'package.json'
       - '.env.example'
+      - '.github/workflows/validate-backend.yml'
 
 permissions:
   contents: read
@@ -101,16 +102,14 @@ jobs:
           grep -q 'POST" && url.pathname === "/report-bug"' server.js
           grep -q 'GITHUB_ISSUES_TOKEN' server.js
           grep -q 'BUG_REPORT_MAX_PER_WINDOW = 5' server.js
-          ! grep -q 'CareerOneStop' server.js
-          ! grep -q 'careerjet' server.js
+          if grep -q 'CareerOneStop' server.js; then echo 'CareerOneStop unexpectedly present'; exit 1; fi
+          if grep -q 'careerjet' server.js; then echo 'CareerJet unexpectedly present'; exit 1; fi
 
-          # Step 2: the Android-selected radius must survive request parsing and both
-          # provider adapters. A regression to the old 100-mile cap must fail CI.
           grep -Fq '? requestedRadius : 25;' server.js
           grep -Fq 'url.searchParams.set("distance", String(radius))' server.js
           grep -Fq 'url.searchParams.set("Radius", String(radius))' server.js
-          ! grep -Fq 'Math.min(requestedRadius, 100)' server.js
-          ! grep -Fq 'Math.min(radius, 100)' server.js
+          if grep -Fq 'Math.min(requestedRadius, 100)' server.js; then echo 'Old request radius cap returned'; exit 1; fi
+          if grep -Fq 'Math.min(radius, 100)' server.js; then echo 'Old provider radius cap returned'; exit 1; fi
 
           if grep -Fq 'const GEO_CACHE_VERSION = "v2";' server.js; then
             grep -q 'GEO_NEGATIVE_CACHE_TTL_MS = 30 \* 60 \* 1000' server.js
@@ -147,14 +146,19 @@ jobs:
           done
           curl -fsS http://127.0.0.1:3100/ >/tmp/root.json
           curl -fsS http://127.0.0.1:3100/health >/tmp/health.json
-          grep -q '9.4.47' /tmp/root.json
+          node - <<'NODE'
+          const fs = require('fs');
+          const root = JSON.parse(fs.readFileSync('/tmp/root.json', 'utf8'));
+          const health = JSON.parse(fs.readFileSync('/tmp/health.json', 'utf8'));
+          if (!root.version || typeof root.version !== 'string') throw new Error('root response missing version');
+          if (health.status !== 'ok') throw new Error(`health status is ${health.status}`);
+          console.log(`Backend HTTP smoke version ${root.version}`);
+          NODE
           grep -q '"ats":"enabled"' /tmp/health.json
           grep -q '"geo_cache_version":"v2"' /tmp/health.json
           grep -q '"firestore_geo_cache":"disabled"' /tmp/health.json
           grep -q 'GeoCache V2:' /tmp/jobbubble-server.log
 
-          # Step 2 runtime check: use a radius above the previous hard cap and verify
-          # the running HTTP handler reports the requested value rather than 100.
           curl -fsS --max-time 90 \
             'http://127.0.0.1:3100/jobs?where=Everett%2C%20WA&lat=47.9780&lon=-122.2021&radius=250&source=ats&what=warehouse&refresh=1' \
             >/tmp/extended-radius.json
@@ -170,7 +174,7 @@ jobs:
           REPORT_STATUS=$(curl -sS -o /tmp/report.json -w '%{http_code}' \
             -X POST http://127.0.0.1:3100/report-bug \
             -H 'Content-Type: application/json' \
-            --data '{"description":"Backend CI bug-report smoke test","app_version":"9.4.47","android_version":"test","device_model":"CI","screen":"CI"}')
+            --data '{"description":"Backend CI bug-report smoke test","app_version":"ci","android_version":"test","device_model":"CI","screen":"CI"}')
           test "$REPORT_STATUS" = "503"
           grep -q 'temporarily unavailable' /tmp/report.json
 
