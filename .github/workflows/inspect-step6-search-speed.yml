@@ -14,42 +14,112 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Benchmark stable production provider and all-source searches
+      - name: Confirm production V9.4.50
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 'https://jobbubble-backend-1.onrender.com/health' > /tmp/health.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/health.json'))
+          assert d.get('status')=='ok', d
+          assert d.get('version')=='9.4.50', d
+          assert d.get('adzuna')=='enabled', d
+          assert d.get('usajobs')=='enabled', d
+          assert d.get('themuse')=='enabled', d
+          assert d.get('ats')=='enabled', d
+          assert d.get('geoapify')=='enabled', d
+          print('Production V9.4.50 and all configured providers are enabled')
+          PY
+
+      - name: Benchmark cold ATS and all-source searches
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&refined=0&refresh=1'
           : > /tmp/results.txt
-          for source in adzuna usajobs themuse ats all; do
+          for source in ats all; do
             OUT="/tmp/${source}.json"
-            METRICS=$(curl -sS --max-time 50 -o "$OUT" -w '%{http_code} %{time_starttransfer} %{time_total}' "$BASE&source=$source" || true)
+            METRICS=$(curl -fsS --max-time 45 -o "$OUT" -w '%{time_starttransfer} %{time_total}' "$BASE&source=$source")
             COUNT=$(python3 - "$OUT" <<'PY'
           import json,sys
-          try:
-              d=json.load(open(sys.argv[1]))
-          except Exception:
-              print('invalid-json -1 -'); raise SystemExit(0)
-          print(len(d.get('jobs',[])) if isinstance(d.get('jobs'),list) else -1, int(bool(d.get('location_refining'))), d.get('cache',''))
+          d=json.load(open(sys.argv[1]))
+          print(len(d.get('jobs',[])), int(bool(d.get('location_refining'))), d.get('cache',''))
           PY
           )
             echo "$source $METRICS $COUNT" | tee -a /tmp/results.txt
           done
+
           echo '--- cache-hit repeat for all ---' | tee -a /tmp/results.txt
           OUT=/tmp/all-hit.json
-          METRICS=$(curl -sS --max-time 30 -o "$OUT" -w '%{http_code} %{time_starttransfer} %{time_total}' 'https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&refined=0&source=all' || true)
+          METRICS=$(curl -fsS --max-time 20 -o "$OUT" -w '%{time_starttransfer} %{time_total}' 'https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&refined=0&source=all')
           COUNT=$(python3 - "$OUT" <<'PY'
           import json,sys
-          try: d=json.load(open(sys.argv[1]))
-          except Exception: print('invalid-json -1 -'); raise SystemExit(0)
-          print(len(d.get('jobs',[])) if isinstance(d.get('jobs'),list) else -1, int(bool(d.get('location_refining'))), d.get('cache',''))
+          d=json.load(open(sys.argv[1])); print(len(d.get('jobs',[])), int(bool(d.get('location_refining'))), d.get('cache',''))
           PY
           )
           echo "all-hit $METRICS $COUNT" | tee -a /tmp/results.txt
           cat /tmp/results.txt
 
-      - name: Upload benchmark
+      - name: Validate speed improvement and response compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          lines=open('/tmp/results.txt').read().splitlines()
+          rows={}
+          for line in lines:
+              m=re.match(r'^(ats|all|all-hit)\s+([0-9.]+)\s+([0-9.]+)\s+(\d+)\s+(\d+)\s+(\S+)',line)
+              if m:
+                  rows[m.group(1)]={
+                      'ttfb':float(m.group(2)), 'total':float(m.group(3)),
+                      'count':int(m.group(4)), 'refining':int(m.group(5)), 'cache':m.group(6)
+                  }
+          assert {'ats','all','all-hit'} <= rows.keys(), rows
+          # Baseline before Step 6: ATS 14.737s, all-source 13.656s. Require a
+          # substantial improvement while allowing normal public-provider variance.
+          assert rows['ats']['total'] < 8.0, rows
+          assert rows['all']['total'] < 8.0, rows
+          assert rows['ats']['count'] > 0, rows
+          assert rows['all']['count'] > 0, rows
+          assert rows['all-hit']['total'] < 1.0, rows
+
+          ats=json.load(open('/tmp/ats.json'))
+          all_data=json.load(open('/tmp/all.json'))
+          assert ats.get('source_filter')=='ats', ats
+          assert all_data.get('source_filter')=='all', all_data
+          assert all(str(j.get('source','')).startswith('ATS/') for j in ats.get('jobs',[])), {j.get('source') for j in ats.get('jobs',[])}
+
+          sources={str(j.get('source','')) for j in all_data.get('jobs',[])}
+          expected_direct={'Adzuna','USAJOBS','The Muse'}
+          missing=expected_direct-sources
+          assert not missing, ('missing provider families',missing,sources)
+          assert any(x.startswith('ATS/') for x in sources), ('ATS missing from all-source response',sources)
+
+          # Preserve the job/search response contract used by Android. Unknown pay is
+          # valid, and location refinement may still be in progress on the quick response.
+          required_top={'jobs','count','radius_miles','source_filter','location_refining'}
+          assert required_top <= all_data.keys(), all_data.keys()
+          for j in all_data.get('jobs',[])[:25]:
+              assert 'id' in j and 'title' in j and 'source' in j, j
+              assert 'location_approximate' in j, j
+              if j.get('location_precision')=='exact':
+                  assert j.get('location_approximate') is False, j
+          print('PASS: production search speed improved and provider/response compatibility is intact')
+          print('Sources:',sorted(sources))
+          PY
+
+      - name: Upload final Step 6 benchmark evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: step6-search-speed-baseline-stable
-          path: /tmp/results.txt
+          name: step6-search-speed-final
+          path: |
+            /tmp/results.txt
+            /tmp/health.json
+            /tmp/ats.json
+            /tmp/all.json
+            /tmp/all-hit.json
+          if-no-files-found: ignore
           retention-days: 3
