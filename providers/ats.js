@@ -9,6 +9,9 @@ const STALE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_BOARDS = [
   { provider: "lever", board: "fixinssoulkitchen", company: "Fixins Soul Kitchen" },
   { provider: "lever", board: "insomniacookies", company: "Insomnia Cookies" },
+  { provider: "lever", board: "gopuff", company: "Gopuff / BevMo!" },
+  { provider: "lever", board: "bluebottlecoffee", company: "Blue Bottle Coffee" },
+  { provider: "lever", board: "thuma", company: "Thuma" },
   { provider: "lever", board: "cscgeneration-2", company: "CSC Generation / Sur La Table" },
   { provider: "greenhouse", board: "jjus", company: "Joe & The Juice" },
   { provider: "greenhouse", board: "philzcoffeecareers", company: "Philz Coffee" },
@@ -308,15 +311,39 @@ function tokenMatch(haystack, query) {
   return tokens.every((token) => text.includes(token));
 }
 
+function hourlyCategoryMatch(job, query) {
+  const key = String(query || "").trim().toLowerCase();
+  const text = [job?.title, job?.company, job?.category, job?.description]
+    .join(" ").toLowerCase();
+
+  // The Android category picker intentionally sends compact backend terms. Expand
+  // only those exact category terms so hourly employer feeds participate in the
+  // existing filters without changing free-text search behavior.
+  if (key === "restaurant") {
+    return /\b(restaurant|cafe|coffee|barista|kitchen|cook|food|hospitality|crew|team member)\b/i.test(text);
+  }
+  if (key === "retail") {
+    return /\b(retail|store|sales associate|shop|cashier|merchandising|key holder)\b/i.test(text);
+  }
+  if (key === "warehouse") {
+    return /\b(warehouse|fulfillment|distribution|forklift|operations associate|inventory|picker|packer)\b/i.test(text);
+  }
+  return null;
+}
+
 function filterAtsJobs(jobs, { query = "", provider = "" } = {}) {
   const providerKey = normalizeProvider(provider);
   let filtered = providerKey
     ? jobs.filter((job) => String(job?.ats_provider || "").toLowerCase() === providerKey)
     : jobs;
   if (!query) return filtered;
-  return filtered.filter((job) => tokenMatch([
-    job.title, job.company, job.category, job.description
-  ].join(" "), query));
+  return filtered.filter((job) => {
+    const categoryMatch = hourlyCategoryMatch(job, query);
+    if (categoryMatch != null) return categoryMatch;
+    return tokenMatch([
+      job.title, job.company, job.category, job.description
+    ].join(" "), query);
+  });
 }
 
 async function fetchAtsJobs({ query = "", provider = "", signal } = {}) {
