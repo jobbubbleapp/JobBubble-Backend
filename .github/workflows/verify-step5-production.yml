@@ -1,0 +1,60 @@
+name: Verify Step 5 Production
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-step5-production.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for V9.4.49 production health
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            if curl -fsS --max-time 15 'https://jobbubble-backend-1.onrender.com/health' > /tmp/health.json; then
+              if python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/health.json'))
+          assert d.get('status')=='ok', d
+          assert d.get('version')=='9.4.49', d
+          assert d.get('geoapify')=='enabled', d
+          assert d.get('posting_address_lookup')=='enabled', d
+          print('Production health is V9.4.49')
+          PY
+              then exit 0; fi
+            fi
+            sleep 3
+          done
+          echo 'Production did not reach V9.4.49 in time'
+          cat /tmp/health.json 2>/dev/null || true
+          exit 1
+
+      - name: Verify live jobs API remains compatible
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 40 \
+            'https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&source=usajobs&refined=1' \
+            > /tmp/jobs.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/jobs.json'))
+          assert isinstance(d.get('jobs'), list), d
+          assert d.get('source_filter')=='usajobs', d
+          assert float(d.get('radius_miles'))==25.0, d
+          assert all(j.get('source')=='USAJOBS' for j in d['jobs']), [j.get('source') for j in d['jobs']]
+          for j in d['jobs']:
+              if j.get('location_match_provider')=='Geoapify verified provider address':
+                  assert j.get('location_precision')=='exact', j
+                  assert j.get('location_approximate') is False, j
+                  assert j.get('location_confidence')=='high', j
+          print('PASS production USAJOBS API:', len(d['jobs']), 'jobs; source isolation intact')
+          PY
