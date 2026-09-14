@@ -1,0 +1,72 @@
+name: Inspect Step 6 ATS Boards
+
+on:
+  push:
+    branches: [feature/step6-search-speed]
+    paths:
+      - '.github/workflows/inspect-step6-ats-boards.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Profile each configured public ATS board
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/ats-board-latency.txt
+          probe(){
+            name="$1"; url="$2"; out="/tmp/$(echo "$name" | tr '/ ' '__').json"
+            metrics=$(curl -sS --max-time 25 -o "$out" -w '%{http_code} %{time_starttransfer} %{time_total} %{size_download}' "$url" || true)
+            count=$(python3 - "$out" <<'PY'
+          import json,sys
+          try: d=json.load(open(sys.argv[1]))
+          except Exception: print(-1); raise SystemExit(0)
+          if isinstance(d,list): print(len(d))
+          elif isinstance(d,dict) and isinstance(d.get('jobs'),list): print(len(d['jobs']))
+          else: print(-1)
+          PY
+          )
+            echo "$name $metrics count=$count" | tee -a /tmp/ats-board-latency.txt
+          }
+          probe 'lever/fixinssoulkitchen' 'https://api.lever.co/v0/postings/fixinssoulkitchen?mode=json&skip=0&limit=100'
+          probe 'lever/insomniacookies' 'https://api.lever.co/v0/postings/insomniacookies?mode=json&skip=0&limit=100'
+          probe 'lever/cscgeneration-2' 'https://api.lever.co/v0/postings/cscgeneration-2?mode=json&skip=0&limit=100'
+          probe 'greenhouse/jjus' 'https://boards-api.greenhouse.io/v1/boards/jjus/jobs?content=true'
+          probe 'greenhouse/philzcoffeecareers' 'https://boards-api.greenhouse.io/v1/boards/philzcoffeecareers/jobs?content=true'
+          probe 'greenhouse/saxbys' 'https://boards-api.greenhouse.io/v1/boards/saxbys/jobs?content=true'
+          probe 'ashby/rothys' 'https://api.ashbyhq.com/posting-api/job-board/rothys?includeCompensation=true'
+          probe 'ashby/tonal' 'https://api.ashbyhq.com/posting-api/job-board/tonal?includeCompensation=true'
+          probe 'ashby/Away' 'https://api.ashbyhq.com/posting-api/job-board/Away?includeCompensation=true'
+          probe 'ashby/renuity' 'https://api.ashbyhq.com/posting-api/job-board/renuity?includeCompensation=true'
+
+      - name: Profile Lever pagination depth
+        shell: bash
+        run: |
+          set -euo pipefail
+          for board in fixinssoulkitchen insomniacookies cscgeneration-2; do
+            echo "--- $board ---" | tee -a /tmp/ats-board-latency.txt
+            for skip in 0 100 200 300 400 500 600 700 800 900; do
+              out="/tmp/${board}-${skip}.json"
+              metrics=$(curl -sS --max-time 20 -o "$out" -w '%{http_code} %{time_total}' "https://api.lever.co/v0/postings/$board?mode=json&skip=$skip&limit=100" || true)
+              count=$(python3 - "$out" <<'PY'
+          import json,sys
+          try: d=json.load(open(sys.argv[1])); print(len(d) if isinstance(d,list) else -1)
+          except Exception: print(-1)
+          PY
+          )
+              echo "skip=$skip $metrics count=$count" | tee -a /tmp/ats-board-latency.txt
+              [ "$count" = "100" ] || break
+            done
+          done
+          cat /tmp/ats-board-latency.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: step6-ats-board-latency
+          path: /tmp/ats-board-latency.txt
+          retention-days: 3
