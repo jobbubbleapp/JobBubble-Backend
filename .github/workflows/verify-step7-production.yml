@@ -1,0 +1,126 @@
+name: Verify Step 7 Production
+
+on:
+  push:
+    branches: [feature/step7-hourly-coverage]
+    paths:
+      - '.github/workflows/verify-step7-production.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Wait for and verify V9.4.51 health
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://jobbubble-backend-1.onrender.com'
+          for i in $(seq 1 24); do
+            if curl -fsS --max-time 15 "$BASE/health" > /tmp/health.json; then
+              version=$(python3 -c "import json;print(json.load(open('/tmp/health.json')).get('version',''))")
+              if [ "$version" = '9.4.51' ]; then break; fi
+            fi
+            sleep 5
+          done
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/health.json'))
+          assert d.get('status')=='ok', d
+          assert d.get('version')=='9.4.51', d
+          assert d.get('ats_boards')==13, d
+          for k in ('adzuna','geoapify','usajobs','themuse','ats'):
+              assert d.get(k)=='enabled', (k,d.get(k),d)
+          print('PASS: production V9.4.51 healthy with 13 ATS boards and all providers enabled')
+          PY
+
+      - name: Verify Step 7 hourly coverage in production searches
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://jobbubble-backend-1.onrender.com/jobs'
+          : > /tmp/timings.txt
+          request(){
+            name="$1"; url="$2"; out="/tmp/$name.json"
+            metrics=$(curl -fsS --max-time 45 -o "$out" -w '%{time_starttransfer} %{time_total}' "$url")
+            echo "$name $metrics" | tee -a /tmp/timings.txt
+          }
+
+          request sf_restaurant "$BASE?where=San%20Francisco%2C%20CA&radius=60&source=ats&what=restaurant&refined=0&refresh=1"
+          request sf_retail "$BASE?where=San%20Francisco%2C%20CA&radius=60&source=ats&what=retail&refined=0&refresh=1"
+          request phl_warehouse "$BASE?where=Philadelphia%2C%20PA&radius=75&source=ats&what=warehouse&refined=0&refresh=1"
+          request all_sources "$BASE?where=San%20Francisco%2C%20CA&radius=60&source=all&refined=0&refresh=1"
+
+          python3 - <<'PY'
+          import json,re
+          restaurant=json.load(open('/tmp/sf_restaurant.json'))
+          retail=json.load(open('/tmp/sf_retail.json'))
+          warehouse=json.load(open('/tmp/phl_warehouse.json'))
+          all_data=json.load(open('/tmp/all_sources.json'))
+
+          for name,d in [('restaurant',restaurant),('retail',retail),('warehouse',warehouse),('all',all_data)]:
+              assert isinstance(d.get('jobs'),list), (name,d)
+              assert d.get('jobs'), (name,'no jobs')
+              assert 'location_refining' in d and 'radius_miles' in d, (name,d.keys())
+              for j in d['jobs'][:30]:
+                  assert all(k in j for k in ('id','title','source','location_approximate')), (name,j)
+                  if j.get('location_precision')=='exact':
+                      assert j.get('location_approximate') is False, (name,j)
+
+          def boards(d):
+              return {str(j.get('ats_board','')).lower() for j in d.get('jobs',[]) if j.get('ats_board')}
+          def companies(d):
+              return {str(j.get('company','')).lower() for j in d.get('jobs',[])}
+
+          food_boards=boards(restaurant)
+          retail_boards=boards(retail)
+          wh_boards=boards(warehouse)
+          combined_boards=food_boards|retail_boards|wh_boards
+          combined_companies=companies(restaurant)|companies(retail)|companies(warehouse)
+
+          # Verify the new public employer feeds actually survive the full production
+          # location/category pipeline, not merely the raw ATS fetch.
+          assert ('bluebottlecoffee' in food_boards or 'blue bottle coffee' in combined_companies), (food_boards,combined_companies)
+          assert ('thuma' in retail_boards or 'thuma' in combined_companies), (retail_boards,combined_companies)
+          assert ('gopuff' in combined_boards or any('gopuff' in c or 'bevmo' in c for c in combined_companies)), (combined_boards,combined_companies)
+
+          # Step 7 must not remove or rename the existing provider families.
+          all_sources={str(j.get('source','')) for j in all_data.get('jobs',[])}
+          assert 'Adzuna' in all_sources, all_sources
+          assert 'USAJOBS' in all_sources, all_sources
+          assert 'The Muse' in all_sources, all_sources
+          assert any(x.startswith('ATS/') for x in all_sources), all_sources
+
+          times={}
+          for line in open('/tmp/timings.txt'):
+              n,ttfb,total=line.split()
+              times[n]=(float(ttfb),float(total))
+          assert times['all_sources'][1] < 10.0, times
+          for n in ('sf_restaurant','sf_retail','phl_warehouse'):
+              assert times[n][1] < 12.0, times
+
+          print('PASS: Step 7 production hourly coverage and provider compatibility verified')
+          print('restaurant jobs',len(restaurant['jobs']),'boards',sorted(food_boards))
+          print('retail jobs',len(retail['jobs']),'boards',sorted(retail_boards))
+          print('warehouse jobs',len(warehouse['jobs']),'boards',sorted(wh_boards))
+          print('all-source families',sorted(all_sources))
+          print('timings',times)
+          PY
+
+      - name: Upload Step 7 production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: step7-production-evidence
+          path: |
+            /tmp/health.json
+            /tmp/timings.txt
+            /tmp/sf_restaurant.json
+            /tmp/sf_retail.json
+            /tmp/phl_warehouse.json
+            /tmp/all_sources.json
+          if-no-files-found: ignore
+          retention-days: 3
