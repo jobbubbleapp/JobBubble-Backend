@@ -1,0 +1,49 @@
+name: Inspect Step 6 Search Speed
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/inspect-step6-search-speed.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Benchmark production provider and all-source searches
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&refined=0&refresh=1'
+          : > /tmp/results.txt
+          for source in adzuna usajobs themuse ats all; do
+            OUT="/tmp/${source}.json"
+            METRICS=$(curl -fsS --max-time 50 -o "$OUT" -w '%{time_starttransfer} %{time_total}' "$BASE&source=$source")
+            COUNT=$(python3 - "$OUT" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          print(len(d.get('jobs',[])), int(bool(d.get('location_refining'))), d.get('cache',''))
+          PY
+          )
+            echo "$source $METRICS $COUNT" | tee -a /tmp/results.txt
+          done
+          echo '--- cache-hit repeat for all ---' | tee -a /tmp/results.txt
+          OUT=/tmp/all-hit.json
+          METRICS=$(curl -fsS --max-time 30 -o "$OUT" -w '%{time_starttransfer} %{time_total}' 'https://jobbubble-backend-1.onrender.com/jobs?where=Everett%2C%20WA&radius=25&refined=0&source=all')
+          COUNT=$(python3 - "$OUT" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1])); print(len(d.get('jobs',[])), int(bool(d.get('location_refining'))), d.get('cache',''))
+          PY
+          )
+          echo "all-hit $METRICS $COUNT" | tee -a /tmp/results.txt
+
+      - name: Upload benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: step6-search-speed-baseline
+          path: /tmp/results.txt
+          retention-days: 3
