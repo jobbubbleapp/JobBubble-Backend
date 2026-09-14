@@ -2,6 +2,37 @@ const http = require("http");
 const fs = require("fs");
 const crypto = require("crypto");
 
+function installMaterializedGeoapifyFetchDedupe() {
+  if (globalThis.__jobbubbleGeoFetchDedupeInstalled) return;
+  const nativeFetch = globalThis.fetch;
+  if (typeof nativeFetch !== "function") return;
+  const inFlight = new Map();
+  const stats = { deduped: 0, started: 0 };
+  globalThis.__jobbubbleGeoFetchDedupeStats = stats;
+  globalThis.__jobbubbleGeoFetchDedupeInstalled = true;
+  globalThis.fetch = function jobbubbleFetch(input, init = {}) {
+    let url = "";
+    try {
+      url = typeof input === "string" ? input : String(input?.url || input || "");
+    } catch (_) {}
+    const method = String(init?.method || input?.method || "GET").toUpperCase();
+    const isGeoapifyGeocode = method === "GET" &&
+      url.startsWith("https://api.geoapify.com/v1/geocode/search");
+    if (!isGeoapifyGeocode) return nativeFetch(input, init);
+    let promise = inFlight.get(url);
+    if (!promise) {
+      stats.started += 1;
+      promise = nativeFetch(input, init).finally(() => inFlight.delete(url));
+      inFlight.set(url, promise);
+    } else {
+      stats.deduped += 1;
+    }
+    return promise.then((response) => response.clone());
+  };
+}
+installMaterializedGeoapifyFetchDedupe();
+
+
 const PORT = process.env.PORT || 3000;
 const ADZUNA_APP_ID = process.env.ADZUNA_APP_ID;
 const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
@@ -16,8 +47,15 @@ const BUG_REPORT_MAX_PER_WINDOW = 5;
 const { fetchMuseJobs, normalizeMuseJob } = require("./providers/themuse");
 const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");
 
-// Geo results barely change, so keep them for a week.
-const GEO_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// GeoCache V2: successful job-location geocodes are stable and can live much
+// longer, while weak/failed matches expire quickly so temporary misses do not poison
+// location quality for a full week.
+const GEO_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const GEO_NEGATIVE_CACHE_TTL_MS = 30 * 60 * 1000;
+const GEO_MEDIUM_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const GEO_AREA_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const GEO_CACHE_MAX_ENTRIES = 5000;
+const GEO_CACHE_VERSION = "v2";
 // Job searches are fresh for 2 minutes and may be served stale for 10 minutes
 // while a refresh runs in the background.
 const JOB_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -32,7 +70,201 @@ const ENRICH_CONCURRENCY = 12;
 // bounded set of remaining location groups is geocoded before radius filtering.
 const MAX_TEXT_LOCATION_GEOCODES_PER_SEARCH = 24;
 
-const geoCache = new Map();
+
+const GEO_STATE_NORMALIZATIONS = [
+  ["alabama","al"],["alaska","ak"],["arizona","az"],["arkansas","ar"],
+  ["california","ca"],["colorado","co"],["connecticut","ct"],["delaware","de"],
+  ["florida","fl"],["georgia","ga"],["hawaii","hi"],["idaho","id"],
+  ["illinois","il"],["indiana","in"],["iowa","ia"],["kansas","ks"],
+  ["kentucky","ky"],["louisiana","la"],["maine","me"],["maryland","md"],
+  ["massachusetts","ma"],["michigan","mi"],["minnesota","mn"],["mississippi","ms"],
+  ["missouri","mo"],["montana","mt"],["nebraska","ne"],["nevada","nv"],
+  ["new hampshire","nh"],["new jersey","nj"],["new mexico","nm"],["new york","ny"],
+  ["north carolina","nc"],["north dakota","nd"],["ohio","oh"],["oklahoma","ok"],
+  ["oregon","or"],["pennsylvania","pa"],["rhode island","ri"],["south carolina","sc"],
+  ["south dakota","sd"],["tennessee","tn"],["texas","tx"],["utah","ut"],
+  ["vermont","vt"],["virginia","va"],["washington","wa"],["west virginia","wv"],
+  ["wisconsin","wi"],["wyoming","wy"],["district of columbia","dc"]
+];
+
+const GEO_STREET_NORMALIZATIONS = [
+  ["street","st"],["avenue","ave"],["boulevard","blvd"],["road","rd"],
+  ["drive","dr"],["lane","ln"],["highway","hwy"],["parkway","pkwy"],
+  ["court","ct"],["circle","cir"],["place","pl"],["terrace","ter"]
+];
+
+const geoCacheStats = {
+  hits: 0,
+  misses: 0,
+  expired: 0,
+  writes: 0,
+  persistent_hydrated: 0,
+  persistent_writes: 0,
+  persistent_errors: 0,
+  weaker_results_rejected: 0
+};
+
+function geoNormalizeText(value) {
+  let out = String(value == null ? "" : value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[#]/g, " number ")
+    .replace(/[^a-z0-9|.,-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  for (const [name, abbreviation] of GEO_STATE_NORMALIZATIONS) {
+    out = out.replace(new RegExp("\\b" + name + "\\b", "g"), abbreviation);
+  }
+  for (const [name, abbreviation] of GEO_STREET_NORMALIZATIONS) {
+    out = out.replace(new RegExp("\\b" + name + "\\b", "g"), abbreviation);
+  }
+  return out.replace(/\s*,\s*/g, ",").replace(/\s+/g, " ").trim();
+}
+
+function normalizeGeoCacheKey(key) {
+  const raw = String(key || "");
+  const versionPrefix = GEO_CACHE_VERSION + "|";
+  if (raw.startsWith(versionPrefix)) return raw;
+  const parts = raw.split("|");
+  const prefix = String(parts.shift() || "geo").toLowerCase().trim();
+  return GEO_CACHE_VERSION + "|" + prefix + "|" + parts.map(geoNormalizeText).join("|");
+}
+
+function geoCacheValueCoordinates(value) {
+  if (!value || typeof value !== "object") return null;
+  const latitude = Number(value.latitude ?? value.lat);
+  const longitude = Number(value.longitude ?? value.lon ?? value.lng);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+  return { latitude, longitude };
+}
+
+function geoCacheQuality(key, value) {
+  if (!value) return 0;
+  let score = 1;
+  const confidence = String(value.confidence || "").toLowerCase();
+  const precision = String(value.precision || "").toLowerCase();
+  const reason = String(value.reason || "").toLowerCase();
+  if (confidence === "high") score += 4;
+  else if (confidence === "medium") score += 2;
+  if (precision === "exact") score += 4;
+  else if (precision === "likely") score += 2;
+  if (reason.includes("address") || key.includes("|explicit-address|") || key.includes("|address|")) score += 3;
+  if (key.includes("|origin|")) score -= 1;
+  return score;
+}
+
+function geoCacheTtlFor(key, value) {
+  if (!value) return GEO_NEGATIVE_CACHE_TTL_MS;
+  const confidence = String(value.confidence || "").toLowerCase();
+  if (confidence === "medium") return GEO_MEDIUM_CACHE_TTL_MS;
+  if (key.includes("|origin|")) return GEO_AREA_CACHE_TTL_MS;
+  if (key.includes("|explicit-address|") || key.includes("|address|")) return GEO_CACHE_TTL_MS;
+  if (confidence === "high") return GEO_CACHE_TTL_MS;
+  return GEO_AREA_CACHE_TTL_MS;
+}
+
+function shouldPersistGeoCacheEntry(key, value) {
+  if (!value || key.includes("|origin|")) return false;
+  if (!geoCacheValueCoordinates(value)) return false;
+  if (String(value.confidence || "").toLowerCase() === "medium") return false;
+  return key.includes("|explicit-address|") || key.includes("|address|") ||
+    (key.includes("|workplace|") && String(value.confidence || "").toLowerCase() === "high");
+}
+
+class SmartGeoCache extends Map {
+  get(key) {
+    const normalized = normalizeGeoCacheKey(key);
+    const entry = super.get(normalized);
+    if (!entry) {
+      geoCacheStats.misses += 1;
+      return undefined;
+    }
+    const expiresAt = Number(entry.expiresAt || 0);
+    if (expiresAt && Date.now() >= expiresAt) {
+      super.delete(normalized);
+      geoCacheStats.expired += 1;
+      geoCacheStats.misses += 1;
+      return undefined;
+    }
+    super.delete(normalized);
+    entry.lastAccess = Date.now();
+    entry.time = Date.now();
+    super.set(normalized, entry);
+    geoCacheStats.hits += 1;
+    return entry;
+  }
+
+  set(key, entry) {
+    const normalized = normalizeGeoCacheKey(key);
+    const now = Date.now();
+    const next = entry && typeof entry === "object"
+      ? { ...entry }
+      : { time: now, value: null };
+    next.time = Number.isFinite(Number(next.time)) ? Number(next.time) : now;
+    next.lastAccess = now;
+    next.expiresAt = Number(next.expiresAt || (now + geoCacheTtlFor(normalized, next.value)));
+
+    const existing = Map.prototype.get.call(this, normalized);
+    if (existing && (!existing.expiresAt || existing.expiresAt > now)) {
+      const oldQuality = geoCacheQuality(normalized, existing.value);
+      const newQuality = geoCacheQuality(normalized, next.value);
+      if (oldQuality > newQuality) {
+        geoCacheStats.weaker_results_rejected += 1;
+        return this;
+      }
+    }
+
+    Map.prototype.delete.call(this, normalized);
+    Map.prototype.set.call(this, normalized, next);
+    geoCacheStats.writes += 1;
+    if (shouldPersistGeoCacheEntry(normalized, next.value)) {
+      persistGeoCacheEntry(normalized, next).catch(() => {});
+    }
+    pruneGeoCache();
+    return this;
+  }
+
+  hydrate(key, entry) {
+    const normalized = normalizeGeoCacheKey(key);
+    if (!entry || Number(entry.expiresAt || 0) <= Date.now()) return;
+    Map.prototype.delete.call(this, normalized);
+    Map.prototype.set.call(this, normalized, { ...entry, lastAccess: Date.now() });
+    pruneGeoCache();
+  }
+
+  delete(key) {
+    return Map.prototype.delete.call(this, normalizeGeoCacheKey(key));
+  }
+
+  has(key) {
+    const normalized = normalizeGeoCacheKey(key);
+    const entry = Map.prototype.get.call(this, normalized);
+    if (!entry) return false;
+    if (entry.expiresAt && Date.now() >= entry.expiresAt) {
+      Map.prototype.delete.call(this, normalized);
+      return false;
+    }
+    return true;
+  }
+}
+
+function pruneGeoCache() {
+  if (typeof geoCache === "undefined") return;
+  const now = Date.now();
+  for (const [key, entry] of geoCache) {
+    if (!entry || (entry.expiresAt && now >= entry.expiresAt)) {
+      Map.prototype.delete.call(geoCache, key);
+    }
+  }
+  while (geoCache.size > GEO_CACHE_MAX_ENTRIES) {
+    const oldestKey = geoCache.keys().next().value;
+    Map.prototype.delete.call(geoCache, oldestKey);
+  }
+}
+
+const geoCache = new SmartGeoCache();
 const postingPageCache = new Map();
 const POSTING_PAGE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // Reuse resolved workplaces so repeated jobs for the same employer/location do not
@@ -62,7 +294,7 @@ function pruneTimedCache(map, maxEntries, maxAgeMs) {
 
 function maintainCaches() {
   pruneTimedCache(jobCache, 120, JOB_STALE_TTL_MS * 2);
-  pruneTimedCache(geoCache, 2500, GEO_CACHE_TTL_MS);
+  pruneGeoCache();
   pruneTimedCache(postingPageCache, 1200, POSTING_PAGE_CACHE_TTL_MS);
   pruneTimedCache(workplaceCache, 2500, WORKPLACE_CACHE_TTL_MS);
   const now = Date.now();
@@ -154,6 +386,91 @@ function readFirestoreField(field) {
   if (Object.prototype.hasOwnProperty.call(field, "booleanValue")) return Boolean(field.booleanValue);
   if (Object.prototype.hasOwnProperty.call(field, "stringValue")) return field.stringValue;
   return null;
+}
+
+
+async function persistGeoCacheEntry(cacheKey, entry) {
+  if (!firestoreEnabled || !cacheKey || !entry || !entry.value) return;
+  try {
+    const token = await getFirebaseAccessToken();
+    if (!token) return;
+    const id = firestoreDocumentId(cacheKey);
+    const project = encodeURIComponent(firebaseServiceAccount.project_id);
+    const url = "https://firestore.googleapis.com/v1/projects/" + project + "/databases/(default)/documents/geo_cache_v2/" + id;
+    const fields = {
+      cache_key: firestoreValue(cacheKey),
+      value_json: firestoreValue(JSON.stringify(entry.value)),
+      updated_at_ms: firestoreValue(Date.now()),
+      expires_at_ms: firestoreValue(Number(entry.expiresAt || 0)),
+      cache_version: firestoreValue(GEO_CACHE_VERSION)
+    };
+    const response = await fetch(url, {
+      method: "PATCH",
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ fields }),
+      signal: AbortSignal.timeout(6000)
+    });
+    if (!response.ok) throw new Error("Firestore geo-cache write HTTP " + response.status);
+    geoCacheStats.persistent_writes += 1;
+  } catch (error) {
+    geoCacheStats.persistent_errors += 1;
+    console.error("Firestore geo-cache write failed:", error.message);
+    throw error;
+  }
+}
+
+async function hydrateGeoCacheFromFirestore() {
+  if (!firestoreEnabled) return 0;
+  try {
+    const token = await getFirebaseAccessToken();
+    if (!token) return 0;
+    const project = encodeURIComponent(firebaseServiceAccount.project_id);
+    let pageToken = "";
+    let loaded = 0;
+    let pages = 0;
+    do {
+      const url = new URL("https://firestore.googleapis.com/v1/projects/" + project + "/databases/(default)/documents/geo_cache_v2");
+      url.searchParams.set("pageSize", "1000");
+      if (pageToken) url.searchParams.set("pageToken", pageToken);
+      const response = await fetch(url, {
+        headers: { Authorization: "Bearer " + token },
+        signal: AbortSignal.timeout(6000)
+      });
+      if (response.status === 404) return loaded;
+      if (!response.ok) throw new Error("Firestore geo-cache read HTTP " + response.status);
+      const payload = await response.json();
+      for (const doc of payload.documents || []) {
+        const f = doc.fields || {};
+        const cacheKey = String(readFirestoreField(f.cache_key) || "");
+        const expiresAt = Number(readFirestoreField(f.expires_at_ms) || 0);
+        const valueJson = String(readFirestoreField(f.value_json) || "");
+        if (!cacheKey || !valueJson || expiresAt <= Date.now()) continue;
+        let value = null;
+        try { value = JSON.parse(valueJson); } catch (_) { continue; }
+        if (!shouldPersistGeoCacheEntry(cacheKey, value)) continue;
+        geoCache.hydrate(cacheKey, {
+          time: Date.now(),
+          lastAccess: Date.now(),
+          expiresAt,
+          value
+        });
+        loaded += 1;
+        if (loaded >= GEO_CACHE_MAX_ENTRIES) break;
+      }
+      pageToken = String(payload.nextPageToken || "");
+      pages += 1;
+    } while (pageToken && loaded < GEO_CACHE_MAX_ENTRIES && pages < 5);
+    geoCacheStats.persistent_hydrated += loaded;
+    if (loaded) console.log("GeoCache V2 hydrated " + loaded + " persistent job-location entries");
+    return loaded;
+  } catch (error) {
+    geoCacheStats.persistent_errors += 1;
+    console.error("Firestore geo-cache hydration failed:", error.message);
+    return 0;
+  }
 }
 
 async function readPersistentWorkplace(cacheKey) {
@@ -1408,11 +1725,20 @@ async function buildSearch(params, cacheKey) {
   // Muse jobs arrive without coordinates. Resolve their provider-supplied area labels
   // before the quick response is finalized; otherwise finalizeJobs drops them and the
   // app can misleadingly show only the one posting that happened to resolve quickly.
+  let areaResolutionPromise = Promise.resolve();
   if (normalized.some((job) =>
     (job?.source === "The Muse" || String(job?.source || "").startsWith("ATS/")) &&
     !validCoordinate(job.latitude, job.longitude)
   )) {
-    await resolveMuseAreaLocations(normalized, origin);
+    areaResolutionPromise = resolveMuseAreaLocations(normalized, origin)
+      .catch((error) => console.error("Background text-location refinement failed:", error.message));
+    // Exact-city anchors are assigned synchronously inside resolveMuseAreaLocations.
+    // Give nearby text locations a brief chance to resolve, then return usable jobs
+    // instead of making the app wait for every cold-cache geocode.
+    await Promise.race([
+      areaResolutionPromise,
+      new Promise((resolve) => setTimeout(resolve, 900))
+    ]);
   }
 
   // Drop jobs that are already clearly outside the requested radius before paying
@@ -1437,11 +1763,15 @@ async function buildSearch(params, cacheKey) {
 
   // Work on the closest jobs first because those are the ones most likely visible.
   const toEnrich = candidates.slice(0, MAX_ENRICH_JOBS);
-  const enrichmentPromise = runWithConcurrency(
+  const directEnrichmentPromise = runWithConcurrency(
     toEnrich,
     ENRICH_CONCURRENCY,
     async (job) => { await enrichJobLocation(job); }
-  ).then(() => {
+  );
+  const enrichmentPromise = Promise.allSettled([
+    directEnrichmentPromise,
+    areaResolutionPromise
+  ]).then(() => {
     const refinedJobs = finalizeJobs(candidates, origin, radius);
     const refinedResponse = {
       count: refinedJobs.length,
@@ -1604,6 +1934,16 @@ const server = http.createServer(async (req, res) => {
         ats_boards: getAtsBoards().length,
         job_cache_entries: jobCache.size,
         geo_cache_entries: geoCache.size,
+        geo_cache_version: GEO_CACHE_VERSION,
+        geo_cache_hits: geoCacheStats.hits,
+        geo_cache_misses: geoCacheStats.misses,
+        geo_cache_expired: geoCacheStats.expired,
+        geo_cache_persistent_hydrated: geoCacheStats.persistent_hydrated,
+        geo_cache_persistent_writes: geoCacheStats.persistent_writes,
+        geo_cache_persistent_errors: geoCacheStats.persistent_errors,
+        geo_cache_weaker_results_rejected: geoCacheStats.weaker_results_rejected,
+        geoapify_requests_deduped: globalThis.__jobbubbleGeoFetchDedupeStats?.deduped || 0,
+        firestore_geo_cache: firestoreEnabled ? "enabled" : "disabled",
         workplace_cache_entries: workplaceCache.size,
         firestore_workplace_cache: firestoreEnabled ? "enabled" : "disabled",
         firestore_cache_policy: "high-confidence-only",
@@ -1630,6 +1970,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+hydrateGeoCacheFromFirestore().catch((error) => {
+  console.error("GeoCache V2 startup hydration failed:", error.message);
+});
+
 server.listen(PORT, () => {
   console.log(`JobBubble backend V9.4.47 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
@@ -1638,6 +1982,7 @@ server.listen(PORT, () => {
   console.log("The Muse:", THE_MUSE_API_KEY ? "enabled" : "disabled");
   console.log("ATS feeds:", `${getAtsBoards().length} employer boards configured`);
   console.log("Fast search cache: enabled");
+  console.log("GeoCache V2: normalized LRU, short negative TTL, request dedupe, persistent job-location cache");
   console.log("Firestore workplace cache:", firestoreEnabled ? "enabled" : "disabled");
   console.log("Firestore cache policy: high-confidence-only");
   console.log("Posting address lookup: enabled");
