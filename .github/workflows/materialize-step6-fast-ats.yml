@@ -1,0 +1,67 @@
+name: Materialize Step 6 Fast ATS
+
+on:
+  push:
+    branches: [feature/step6-production]
+    paths:
+      - 'scripts/step6-fast-ats.js'
+      - '.github/workflows/materialize-step6-fast-ats.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/step6-production
+          fetch-depth: 0
+      - name: Apply tested Step 6 patch
+        run: node scripts/step6-fast-ats.js
+      - name: Validate runtime and completeness
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          node --check providers/ats.js
+          git diff --check
+          grep -Fq 'const pageSize = 1000;' providers/ats.js
+          ! grep -Fq 'const pageSize = 100;' providers/ats.js
+          grep -Fq 'JobBubble backend V9.4.50 listening' server.js
+          node - <<'JS'
+          const assert=require('assert');
+          process.env.ATS_USE_DEFAULT_BOARDS='false';
+          process.env.ATS_BOARDS_JSON=JSON.stringify([{provider:'lever',board:'synthetic-big-board',company:'Synthetic Co'}]);
+          let calls=0;
+          global.fetch=async(input)=>{
+            calls++;
+            const u=new URL(String(input));
+            assert.equal(Number(u.searchParams.get('limit')),1000);
+            assert.equal(Number(u.searchParams.get('skip')),0);
+            const jobs=Array.from({length:1000},(_,i)=>({id:String(i),text:`Job ${i}`,categories:{location:'Everett, WA'},descriptionPlain:'Hourly job',hostedUrl:`https://example.test/${i}`}));
+            return new Response(JSON.stringify(jobs),{status:200,headers:{'content-type':'application/json'}});
+          };
+          const {fetchAtsJobs}=require('./providers/ats');
+          (async()=>{
+            const jobs=await fetchAtsJobs({signal:AbortSignal.timeout(3000)});
+            assert.equal(jobs.length,1000);
+            assert.equal(calls,1);
+            console.log('Synthetic completeness test passed');
+          })().catch(e=>{console.error(e);process.exit(1)});
+          JS
+      - name: Commit materialized V9.4.50 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add providers/ats.js server.js
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --cached --quiet; then
+            echo 'Step 6 runtime already materialized'
+            exit 0
+          fi
+          git commit -m 'Materialize Step 6 fast ATS pagination'
+          git push origin HEAD:feature/step6-production
