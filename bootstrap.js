@@ -40,14 +40,12 @@ function installGeoapifyFetchDedupe() {
     let promise = inFlight.get(key);
     if (!promise) {
       stats.started += 1;
-      promise = nativeFetch(input, init)
-        .finally(() => inFlight.delete(key));
+      promise = nativeFetch(input, init).finally(() => inFlight.delete(key));
       inFlight.set(key, promise);
     } else {
       stats.deduped += 1;
     }
 
-    // Each consumer gets its own Response body while sharing one network request.
     return promise.then((response) => response.clone());
   };
 }
@@ -104,20 +102,21 @@ function geoNormalizeText(value) {
     .replace(/\s+/g, " ")
     .trim();
   for (const [name, abbreviation] of GEO_STATE_NORMALIZATIONS) {
-    out = out.replace(new RegExp(`\\b${name}\\b`, "g"), abbreviation);
+    out = out.replace(new RegExp("\\b" + name + "\\b", "g"), abbreviation);
   }
   for (const [name, abbreviation] of GEO_STREET_NORMALIZATIONS) {
-    out = out.replace(new RegExp(`\\b${name}\\b`, "g"), abbreviation);
+    out = out.replace(new RegExp("\\b" + name + "\\b", "g"), abbreviation);
   }
   return out.replace(/\s*,\s*/g, ",").replace(/\s+/g, " ").trim();
 }
 
 function normalizeGeoCacheKey(key) {
   const raw = String(key || "");
-  if (raw.startsWith(`${GEO_CACHE_VERSION}|`)) return raw;
+  const versionPrefix = GEO_CACHE_VERSION + "|";
+  if (raw.startsWith(versionPrefix)) return raw;
   const parts = raw.split("|");
   const prefix = String(parts.shift() || "geo").toLowerCase().trim();
-  return `${GEO_CACHE_VERSION}|${prefix}|${parts.map(geoNormalizeText).join("|")}`;
+  return GEO_CACHE_VERSION + "|" + prefix + "|" + parts.map(geoNormalizeText).join("|");
 }
 
 function geoCacheValueCoordinates(value) {
@@ -155,8 +154,6 @@ function geoCacheTtlFor(key, value) {
 }
 
 function shouldPersistGeoCacheEntry(key, value) {
-  // Never persist the user's arbitrary search-origin text. It can be a home address.
-  // Persistent storage is reserved for public job/workplace location data.
   if (!value || key.includes("|origin|")) return false;
   if (!geoCacheValueCoordinates(value)) return false;
   if (String(value.confidence || "").toLowerCase() === "medium") return false;
@@ -179,8 +176,6 @@ class SmartGeoCache extends Map {
       geoCacheStats.misses += 1;
       return undefined;
     }
-    // Touch the entry and move it to the end, giving us true LRU eviction while
-    // keeping the legacy caller's age check compatible with per-entry expirations.
     super.delete(normalized);
     entry.lastAccess = Date.now();
     entry.time = Date.now();
@@ -280,7 +275,7 @@ async function persistGeoCacheEntry(cacheKey, entry) {
     if (!token) return;
     const id = firestoreDocumentId(cacheKey);
     const project = encodeURIComponent(firebaseServiceAccount.project_id);
-    const url = `https://firestore.googleapis.com/v1/projects/${project}/databases/(default)/documents/geo_cache_v2/${id}`;
+    const url = "https://firestore.googleapis.com/v1/projects/" + project + "/databases/(default)/documents/geo_cache_v2/" + id;
     const fields = {
       cache_key: firestoreValue(cacheKey),
       value_json: firestoreValue(JSON.stringify(entry.value)),
@@ -291,13 +286,13 @@ async function persistGeoCacheEntry(cacheKey, entry) {
     const response = await fetch(url, {
       method: "PATCH",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: "Bearer " + token,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ fields }),
       signal: AbortSignal.timeout(6000)
     });
-    if (!response.ok) throw new Error(`Firestore geo-cache write HTTP ${response.status}`);
+    if (!response.ok) throw new Error("Firestore geo-cache write HTTP " + response.status);
     geoCacheStats.persistent_writes += 1;
   } catch (error) {
     geoCacheStats.persistent_errors += 1;
@@ -316,15 +311,15 @@ async function hydrateGeoCacheFromFirestore() {
     let loaded = 0;
     let pages = 0;
     do {
-      const url = new URL(`https://firestore.googleapis.com/v1/projects/${project}/databases/(default)/documents/geo_cache_v2`);
+      const url = new URL("https://firestore.googleapis.com/v1/projects/" + project + "/databases/(default)/documents/geo_cache_v2");
       url.searchParams.set("pageSize", "1000");
       if (pageToken) url.searchParams.set("pageToken", pageToken);
       const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: "Bearer " + token },
         signal: AbortSignal.timeout(6000)
       });
       if (response.status === 404) return loaded;
-      if (!response.ok) throw new Error(`Firestore geo-cache read HTTP ${response.status}`);
+      if (!response.ok) throw new Error("Firestore geo-cache read HTTP " + response.status);
       const payload = await response.json();
       for (const doc of payload.documents || []) {
         const f = doc.fields || {};
@@ -348,7 +343,7 @@ async function hydrateGeoCacheFromFirestore() {
       pages += 1;
     } while (pageToken && loaded < GEO_CACHE_MAX_ENTRIES && pages < 5);
     geoCacheStats.persistent_hydrated += loaded;
-    if (loaded) console.log(`GeoCache V2 hydrated ${loaded} persistent job-location entries`);
+    if (loaded) console.log("GeoCache V2 hydrated " + loaded + " persistent job-location entries");
     return loaded;
   } catch (error) {
     geoCacheStats.persistent_errors += 1;
