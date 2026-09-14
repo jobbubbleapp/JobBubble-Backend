@@ -31,10 +31,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import subprocess, pathlib
+          import subprocess, pathlib, re
           files=[x.decode('utf-8','replace') for x in subprocess.check_output(['git','ls-files','-z']).split(b'\0') if x]
           bad=[]
           text_ext={'.js','.json','.md','.yml','.yaml','.txt','.sh','.py','.xml','.properties','.gradle','.kts','.toml'}
+          conflict=re.compile(r'(?m)^(?:<<<<<<< .+|=======|>>>>>>> .+)$')
           for f in files:
               p=pathlib.Path(f); b=p.read_bytes()
               if p.suffix.lower() in text_ext or p.name in {'package.json','.gitignore'}:
@@ -43,8 +44,7 @@ jobs:
                   try: s=b.decode('utf-8')
                   except UnicodeDecodeError as e:
                       bad.append(f'Invalid UTF-8: {p}: {e}'); continue
-                  for marker in ('<<<<<<< ','>>>>>>> '):
-                      if marker in s: bad.append(f'Merge-conflict marker in {p}: {marker.strip()}')
+                  if conflict.search(s): bad.append(f'Merge-conflict marker in {p}')
           if bad:
               print('\n'.join(bad)); raise SystemExit(1)
           print(f'PASS: {len(files)} tracked files scanned for text corruption/conflicts')
@@ -107,7 +107,6 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import pathlib,re,subprocess
-          root=pathlib.Path('.')
           js=[pathlib.Path(x.decode()) for x in subprocess.check_output(['git','ls-files','-z','*.js']).split(b'\0') if x]
           missing=[]
           for p in js:
