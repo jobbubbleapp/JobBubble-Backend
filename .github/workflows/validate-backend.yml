@@ -10,6 +10,7 @@ on:
       - 'providers/**'
       - 'server.js'
       - 'bootstrap.js'
+      - 'bootstrap-fast.js'
       - 'package.json'
       - '.env.example'
   pull_request:
@@ -17,6 +18,7 @@ on:
       - 'providers/**'
       - 'server.js'
       - 'bootstrap.js'
+      - 'bootstrap-fast.js'
       - 'package.json'
       - '.env.example'
 
@@ -35,7 +37,8 @@ jobs:
         run: |
           node --check server.js
           node --check bootstrap.js
-          node bootstrap.js --check
+          node --check bootstrap-fast.js
+          node bootstrap-fast.js --check
           node --check providers/ats.js
           node --check providers/themuse.js
       - name: Fetch and validate live public ATS jobs
@@ -86,13 +89,16 @@ jobs:
           grep -q 'hydrateGeoCacheFromFirestore' bootstrap.js
           grep -q 'shouldPersistGeoCacheEntry' bootstrap.js
           grep -q '__jobbubbleGeoFetchDedupeStats' bootstrap.js
+          grep -q 'setTimeout(resolve, 900)' bootstrap-fast.js
+          grep -q 'Promise.allSettled' bootstrap-fast.js
+          grep -q 'node bootstrap-fast.js' package.json
           ! grep -q 'CareerOneStop' server.js
           ! grep -q 'careerjet' server.js
       - name: Start backend and smoke-test HTTP endpoints
         shell: bash
         run: |
           set -euo pipefail
-          PORT=3100 node bootstrap.js >/tmp/jobbubble-server.log 2>&1 &
+          PORT=3100 node bootstrap-fast.js >/tmp/jobbubble-server.log 2>&1 &
           PID=$!
           trap 'kill $PID 2>/dev/null || true' EXIT
           for i in 1 2 3 4 5 6 7 8 9 10; do
