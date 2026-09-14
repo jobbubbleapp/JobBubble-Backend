@@ -1,0 +1,61 @@
+name: Apply Step 3 Pay Filter
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/step3_pay_filter.py'
+      - '.github/workflows/apply-step3-pay-filter.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply Step 3 backend patch
+        run: python3 scripts/step3_pay_filter.py server.js
+
+      - name: Validate backend syntax and wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          git diff --check
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('server.js').read_text()
+          checks={
+            'query parsing':'url.searchParams.get("min_pay_hourly")',
+            'cache key':'Number(minPayHourly).toFixed(2)',
+            'unknown salary preservation':'return hourly == null || hourly >= minPayHourly;',
+            'Adzuna companion salary search':'url.searchParams.set("salary_min"',
+            'Adzuna merge':'Promise.allSettled([basePromise, targetedPromise])',
+            'pay candidate filtering':'const payEligible = normalized.filter',
+            'provider propagation':'fetchAdzunaJobs(where, radius, query, minPayHourly)',
+            'backend version':'JobBubble backend V9.4.48 listening',
+          }
+          missing=[name for name,token in checks.items() if token not in s]
+          if missing: raise SystemExit('missing Step 3 wiring: '+', '.join(missing))
+          print('Step 3 backend static validation passed')
+          PY
+
+      - name: Commit materialized backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add server.js
+          if git diff --cached --quiet; then
+            echo 'server.js already contains Step 3 patch'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Materialize Step 3 minimum-pay search support'
+          git push origin HEAD:main
