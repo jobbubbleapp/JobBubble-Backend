@@ -1,0 +1,40 @@
+name: Inspect Step 6 Lever Limits
+
+on:
+  push:
+    branches: [feature/step6-search-speed]
+    paths:
+      - '.github/workflows/inspect-step6-lever-limit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Test Lever page sizes without changing production
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/lever-limit.txt
+          for board in insomniacookies cscgeneration-2; do
+            for limit in 100 200 500 1000; do
+              out="/tmp/${board}-${limit}.json"
+              metrics=$(curl -sS --max-time 30 -o "$out" -w '%{http_code} %{time_starttransfer} %{time_total} %{size_download}' "https://api.lever.co/v0/postings/$board?mode=json&skip=0&limit=$limit" || true)
+              count=$(python3 - "$out" <<'PY'
+          import json,sys
+          try: d=json.load(open(sys.argv[1])); print(len(d) if isinstance(d,list) else -1)
+          except Exception: print(-1)
+          PY
+          )
+              echo "$board limit=$limit $metrics count=$count" | tee -a /tmp/lever-limit.txt
+            done
+          done
+          cat /tmp/lever-limit.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: step6-lever-limit
+          path: /tmp/lever-limit.txt
+          retention-days: 3
