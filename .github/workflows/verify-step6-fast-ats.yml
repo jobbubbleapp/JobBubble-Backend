@@ -1,0 +1,80 @@
+name: Verify Step 6 Fast ATS
+
+on:
+  push:
+    branches: [feature/step6-search-speed]
+    paths:
+      - 'scripts/step6-fast-ats.js'
+      - '.github/workflows/verify-step6-fast-ats.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply Step 6 patch in test workspace
+        run: node scripts/step6-fast-ats.js
+      - name: Static validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          node --check providers/ats.js
+          git diff --check
+          grep -Fq 'const pageSize = 1000;' providers/ats.js
+          ! grep -Fq 'const pageSize = 100;' providers/ats.js
+          grep -Fq 'JobBubble backend V9.4.50 listening' server.js
+      - name: Synthetic Lever completeness and request-count test
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'JS'
+          const assert = require('assert');
+          process.env.ATS_USE_DEFAULT_BOARDS = 'false';
+          process.env.ATS_BOARDS_JSON = JSON.stringify([
+            { provider:'lever', board:'synthetic-big-board', company:'Synthetic Co' }
+          ]);
+          const calls=[];
+          global.fetch = async (input) => {
+            const u = new URL(String(input));
+            calls.push(u.toString());
+            const limit = Number(u.searchParams.get('limit'));
+            const skip = Number(u.searchParams.get('skip'));
+            assert.equal(limit, 1000, 'Lever page size must be 1000');
+            assert.equal(skip, 0, 'A 1000-job capped board should require only one request');
+            const jobs = Array.from({length:1000}, (_,i) => ({
+              id:String(i), text:`Job ${i}`,
+              categories:{ location:'Everett, WA' },
+              descriptionPlain:'Hourly job',
+              hostedUrl:`https://example.test/${i}`
+            }));
+            return new Response(JSON.stringify(jobs), {status:200,headers:{'content-type':'application/json'}});
+          };
+          const { fetchAtsJobs } = require('./providers/ats');
+          (async()=>{
+            const jobs=await fetchAtsJobs({signal:AbortSignal.timeout(3000)});
+            assert.equal(jobs.length,1000,'all 1000 capped jobs must be preserved');
+            assert.equal(calls.length,1,'1000 jobs should be fetched in one Lever request');
+            console.log('PASS: 1000 jobs preserved with one Lever request');
+          })().catch(e=>{console.error(e);process.exit(1)});
+          JS
+      - name: Real public ATS cold-fetch benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'JS'
+          const { performance } = require('perf_hooks');
+          const { fetchAtsJobs } = require('./providers/ats');
+          (async()=>{
+            const started=performance.now();
+            const jobs=await fetchAtsJobs({signal:AbortSignal.timeout(12000)});
+            const seconds=(performance.now()-started)/1000;
+            if (jobs.length < 1000) throw new Error(`expected broad ATS feed, got ${jobs.length} jobs`);
+            if (seconds >= 10) throw new Error(`Step 6 ATS cold fetch still too slow: ${seconds.toFixed(3)}s`);
+            console.log(`PASS: public ATS cold fetch ${seconds.toFixed(3)}s for ${jobs.length} jobs`);
+          })().catch(e=>{console.error(e);process.exit(1)});
+          JS
