@@ -1,0 +1,153 @@
+name: Apply Step 5 Location Accuracy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/step5-provider-address-verification.js'
+      - '.github/workflows/apply-step5-location-accuracy.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply Step 5 backend patch
+        run: node scripts/step5-provider-address-verification.js
+
+      - name: Validate syntax and Step 5 wiring
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check server.js
+          git diff --check
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('server.js').read_text()
+          checks={
+            'provider address verification':'geoapifyExplicitAddress(job, job.location, "provider-location-address")',
+            'verified exact result':'job.location_match_provider = "Geoapify verified provider address";',
+            'fallback stays approximate':'street address unverified',
+            'USAJOBS pending verification':'USAJOBS address pending verification',
+            'Adzuna pending verification':'Adzuna address pending verification',
+            'backend version':'JobBubble backend V9.4.49 listening',
+          }
+          missing=[name for name,token in checks.items() if token not in s]
+          if missing: raise SystemExit('missing Step 5 wiring: '+', '.join(missing))
+          if 'if (looksLikeStreetAddress(job.location)) {\n    job.location_precision = "exact";' in s:
+              raise SystemExit('old unverified exact-location shortcut remains')
+          print('Step 5 static validation passed')
+          PY
+
+      - name: Synthetic exact-address and fallback HTTP test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/step5-preload.js" <<'JS'
+          const originalFetch = globalThis.fetch;
+          globalThis.fetch = async function step5MockFetch(input, init = {}) {
+            const raw = typeof input === 'string' ? input : String(input?.url || input || '');
+            if (raw.startsWith('https://data.usajobs.gov/api/search')) {
+              const item = (id, title, company, location, lat, lon) => ({
+                MatchedObjectId: id,
+                MatchedObjectDescriptor: {
+                  PositionID: id,
+                  PositionTitle: title,
+                  OrganizationName: company,
+                  PositionLocation: [{ LocationName: location, Latitude: lat, Longitude: lon }],
+                  PositionRemuneration: [],
+                  JobCategory: [],
+                  ApplyURI: [],
+                  PublicationStartDate: '2026-09-14T00:00:00Z',
+                  UserArea: { Details: { JobSummary: '' } }
+                }
+              });
+              const payload = {
+                SearchResult: { SearchResultItems: [
+                  item('VERIFY-1','Verified address job','Verified Co','123 Verified St, Everett, WA 98201',47.9500,-122.2300),
+                  item('FALLBACK-1','Fallback address job','Fallback Co','999 Missing Rd, Everett, WA 98201',47.9700,-122.2100)
+                ] }
+              };
+              return new Response(JSON.stringify(payload), { status: 200, headers: { 'content-type': 'application/json' } });
+            }
+            if (raw.startsWith('https://api.geoapify.com/v1/geocode/search')) {
+              const u = new URL(raw);
+              const text = String(u.searchParams.get('text') || '');
+              if (text.includes('123 Verified St')) {
+                return new Response(JSON.stringify({ results: [{
+                  lat: 47.9801, lon: -122.2015,
+                  formatted: '123 Verified St, Everett, WA 98201, United States'
+                }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+              }
+              if (text.includes('999 Missing Rd')) {
+                return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+              }
+              return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+            }
+            return originalFetch(input, init);
+          };
+          JS
+
+          PORT=3105 \
+          USAJOBS_API_KEY=test \
+          USAJOBS_EMAIL=test@example.com \
+          GEOAPIFY_API_KEY=test \
+          NODE_OPTIONS="--require=$RUNNER_TEMP/step5-preload.js" \
+          node server.js > "$RUNNER_TEMP/step5-server.log" 2>&1 &
+          PID=$!
+          trap 'kill $PID 2>/dev/null || true; cat "$RUNNER_TEMP/step5-server.log" || true' EXIT
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3105/health >/dev/null; then break; fi
+            sleep 0.2
+          done
+          curl -fsS 'http://127.0.0.1:3105/jobs?lat=47.9780&lon=-122.2021&radius=50&source=usajobs&refined=1' > "$RUNNER_TEMP/step5-jobs.json"
+
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'step5-jobs.json'
+          data=json.loads(p.read_text())
+          jobs={j.get('id'):j for j in data.get('jobs',[])}
+          v=jobs.get('VERIFY-1'); f=jobs.get('FALLBACK-1')
+          assert v, data
+          assert v.get('location_precision')=='exact', v
+          assert v.get('location_approximate') is False, v
+          assert v.get('location_confidence')=='high', v
+          assert v.get('location_match_provider')=='Geoapify verified provider address', v
+          assert abs(float(v.get('latitude'))-47.9801)<0.00001, v
+          assert abs(float(v.get('longitude'))-(-122.2015))<0.00001, v
+          assert f, data
+          assert f.get('location_precision')=='area', f
+          assert f.get('location_approximate') is True, f
+          assert 'area estimate' in str(f.get('location_match_provider','')).lower(), f
+          assert abs(float(f.get('latitude'))-47.9700)<0.00001, f
+          assert abs(float(f.get('longitude'))-(-122.2100))<0.00001, f
+          print('PASS: verified street address uses geocoded pin; failed verification keeps provider best-estimate pin')
+          PY
+
+          kill $PID
+          wait $PID || true
+          trap - EXIT
+
+      - name: Commit materialized V9.4.49 backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add server.js
+          if git diff --cached --quiet; then
+            echo 'server.js already contains Step 5 patch'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Materialize Step 5 provider address verification'
+          git push origin HEAD:main
