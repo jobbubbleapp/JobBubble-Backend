@@ -1,0 +1,89 @@
+name: Inspect Step 7 Hourly Boards
+
+on:
+  push:
+    branches: [feature/step7-hourly-coverage]
+    paths:
+      - '.github/workflows/inspect-step7-hourly-boards.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe candidate hourly-heavy public ATS feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess, time, re
+
+          feeds = [
+              ('lever','gopuff','https://api.lever.co/v0/postings/gopuff?mode=json&skip=0&limit=1000'),
+              ('lever','bluebottlecoffee','https://api.lever.co/v0/postings/bluebottlecoffee?mode=json&skip=0&limit=1000'),
+              ('lever','thuma','https://api.lever.co/v0/postings/thuma?mode=json&skip=0&limit=1000'),
+              ('greenhouse','sweetgreen','https://boards-api.greenhouse.io/v1/boards/sweetgreen/jobs?content=true'),
+          ]
+          hourly_words = re.compile(r'barista|retail|associate|warehouse|operations associate|crew|team member|cashier|store|cafe|kitchen|cook|hourly|part[- ]time', re.I)
+          results=[]
+          for provider, board, url in feeds:
+              out=f'/tmp/{board}.json'
+              started=time.time()
+              p=subprocess.run(['curl','-sS','-L','--max-time','25','-w','\n%{http_code}','-o',out,url],capture_output=True,text=True)
+              elapsed=time.time()-started
+              code=(p.stdout.strip().splitlines()[-1] if p.stdout.strip() else '000')
+              try:
+                  data=json.load(open(out))
+              except Exception:
+                  data=None
+              if provider=='lever' and isinstance(data,list): jobs=data
+              elif provider=='greenhouse' and isinstance(data,dict) and isinstance(data.get('jobs'),list): jobs=data['jobs']
+              else: jobs=[]
+              texts=[]
+              locations=[]
+              part_time=0
+              for j in jobs:
+                  if provider=='lever':
+                      title=str(j.get('text',''))
+                      cats=j.get('categories') or {}
+                      loc=str(cats.get('location',''))
+                      commit=str(cats.get('commitment',''))
+                      team=str(cats.get('team',''))
+                      text=' '.join([title,team,commit,loc])
+                      if 'part' in commit.lower(): part_time+=1
+                  else:
+                      title=str(j.get('title',''))
+                      loc=str((j.get('location') or {}).get('name',''))
+                      depts=' '.join(str(x.get('name','')) for x in (j.get('departments') or []))
+                      text=' '.join([title,depts,loc])
+                  texts.append(text)
+                  locations.append(loc)
+              hourly=sum(bool(hourly_words.search(t)) for t in texts)
+              sample=[t[:160] for t in texts if hourly_words.search(t)][:8]
+              distinct_locations=len({x.strip().lower() for x in locations if x.strip()})
+              results.append({
+                  'provider':provider,'board':board,'http':code,'seconds':round(elapsed,3),
+                  'jobs':len(jobs),'hourly_like':hourly,'part_time':part_time,
+                  'distinct_locations':distinct_locations,'sample':sample
+              })
+          print(json.dumps(results,indent=2))
+          open('/tmp/step7-hourly-boards.json','w').write(json.dumps(results,indent=2))
+
+          by={r['board']:r for r in results}
+          assert by['gopuff']['http']=='200' and by['gopuff']['jobs']>=100, by['gopuff']
+          assert by['gopuff']['hourly_like']>=50, by['gopuff']
+          assert by['gopuff']['distinct_locations']>=20, by['gopuff']
+          assert by['bluebottlecoffee']['http']=='200' and by['bluebottlecoffee']['jobs']>=10, by['bluebottlecoffee']
+          assert by['bluebottlecoffee']['hourly_like']>=5, by['bluebottlecoffee']
+          assert by['thuma']['http']=='200' and by['thuma']['jobs']>=5, by['thuma']
+          print('PASS: core no-key candidate boards provide meaningful hourly/local-service coverage')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: step7-hourly-board-diagnostic
+          path: /tmp/step7-hourly-boards.json
+          retention-days: 3
