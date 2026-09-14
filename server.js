@@ -1292,9 +1292,10 @@ function normalizeUSAJobsJob(item, origin) {
       descriptor.PositionFormattedDescription?.[0]?.Content || "",
     apply_url: applyUris[0] || descriptor.PositionURI || "",
     posted_at: descriptor.PublicationStartDate || descriptor.PositionStartDate || "",
-    location_precision: exact ? "exact" : "area",
-    location_approximate: !exact,
-    location_match_provider: "USAJOBS"
+    location_precision: exact ? "likely" : "area",
+    location_approximate: true,
+    location_confidence: exact ? "medium" : "low",
+    location_match_provider: exact ? "USAJOBS address pending verification" : "USAJOBS"
   };
 }
 
@@ -1319,20 +1320,45 @@ function normalizeAdzunaJob(item) {
     description: item.description || "",
     apply_url: item.redirect_url || "",
     posted_at: item.created || "",
-    location_precision: exact ? "exact" : "area",
-    location_approximate: !exact,
-    location_match_provider: null
+    location_precision: exact ? "likely" : "area",
+    location_approximate: true,
+    location_confidence: exact ? "medium" : "low",
+    location_match_provider: exact ? "Adzuna address pending verification" : null
   };
 }
 
 async function enrichJobLocation(job) {
   if (!job) return job;
 
+  // V9.4.49: a street address in provider text is strong evidence, but the provider
+  // coordinate beside it can still be only a city/area centroid. Geocode the address
+  // itself before calling the map pin exact. If verification is unavailable or fails,
+  // keep the provider coordinate as an approximate fallback instead of dropping the job.
   if (looksLikeStreetAddress(job.location)) {
-    job.location_precision = "exact";
-    job.location_approximate = false;
-    job.location_confidence = "high";
-    return job;
+    const providerAddress = await geoapifyExplicitAddress(job, job.location, "provider-location-address");
+    if (providerAddress) {
+      job.latitude = providerAddress.latitude;
+      job.longitude = providerAddress.longitude;
+      job.location = providerAddress.location || job.location;
+      job.location_precision = "exact";
+      job.location_approximate = false;
+      job.location_confidence = "high";
+      job.location_match_provider = "Geoapify verified provider address";
+      rememberWorkplace(job, {
+        latitude: job.latitude,
+        longitude: job.longitude,
+        location: job.location,
+        precision: "exact",
+        confidence: "high"
+      });
+      return job;
+    }
+    if (validCoordinate(job.latitude, job.longitude)) {
+      job.location_precision = "area";
+      job.location_approximate = true;
+      job.location_confidence = "low";
+      job.location_match_provider = (job.source || "Provider") + " area estimate; street address unverified";
+    }
   }
 
   // V9.4.35: trust evidence from the current posting before any learned cache.
@@ -1984,13 +2010,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.48" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.49" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.48",
+        version: "9.4.49",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -2040,7 +2066,7 @@ hydrateGeoCacheFromFirestore().catch((error) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.48 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.49 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
