@@ -1494,7 +1494,7 @@ async function fetchAdzunaJobs(where, radius, query) {
   url.searchParams.set("results_per_page", "50");
   if (where) url.searchParams.set("where", where);
   if (query) url.searchParams.set("what", query);
-  if (radius > 0) url.searchParams.set("distance", String(Math.min(radius, 100)));
+  if (radius > 0) url.searchParams.set("distance", String(radius));
   url.searchParams.set("content-type", "application/json");
 
   const response = await fetch(url, { signal: AbortSignal.timeout(12000) });
@@ -1517,7 +1517,7 @@ async function fetchUSAJobs(where, radius, query) {
   url.searchParams.set("WhoMayApply", "Public");
   if (where) url.searchParams.set("LocationName", where);
   if (query) url.searchParams.set("Keyword", query);
-  if (radius > 0 && where) url.searchParams.set("Radius", String(Math.min(radius, 100)));
+  if (radius > 0 && where) url.searchParams.set("Radius", String(radius));
 
   const response = await fetch(url, {
     headers: {
@@ -1833,7 +1833,7 @@ async function handleJobs(req, res, url) {
     ).trim();
     const requestedRadius = Number(url.searchParams.get("radius") || 25);
     const radius = Number.isFinite(requestedRadius) && requestedRadius > 0
-      ? Math.min(requestedRadius, 100) : 25;
+      ? requestedRadius : 25;
     const centerLat = Number(url.searchParams.get("lat"));
     const centerLon = Number(url.searchParams.get("lon"));
     const source = normalizeSource(url.searchParams.get("source"));
