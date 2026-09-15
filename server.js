@@ -46,6 +46,7 @@ const BUG_REPORT_WINDOW_MS = 10 * 60 * 1000;
 const BUG_REPORT_MAX_PER_WINDOW = 5;
 const { fetchMuseJobs, normalizeMuseJob } = require("./providers/themuse");
 const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");
+const { extractStreetAddress: extractStreetAddressStrict, geocoderResultMatchesAddress } = require("./location-integrity");
 
 // GeoCache V2: successful job-location geocodes are stable and can live much
 // longer, while weak/failed matches expire quickly so temporary misses do not poison
@@ -55,7 +56,7 @@ const GEO_NEGATIVE_CACHE_TTL_MS = 30 * 60 * 1000;
 const GEO_MEDIUM_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const GEO_AREA_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const GEO_CACHE_MAX_ENTRIES = 5000;
-const GEO_CACHE_VERSION = "v2";
+const GEO_CACHE_VERSION = "v3";
 // Job searches are fresh for 2 minutes and may be served stale for 10 minutes
 // while a refresh runs in the background.
 const JOB_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -272,6 +273,7 @@ const POSTING_PAGE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // it can use a much longer lifetime.
 const workplaceCache = new Map();
 const WORKPLACE_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const WORKPLACE_CACHE_VERSION = "v2";
 // Medium-confidence matches may help during the current server session, but expire
 // quickly and are never persisted to Firestore.
 const MEDIUM_WORKPLACE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -753,16 +755,7 @@ function normalizeName(value) {
 }
 
 function extractStreetAddress(text) {
-  const plain = String(text || "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  const match = plain.match(
-    /\b\d{1,6}\s+[A-Za-z0-9.'#&\- ]{2,55}\s(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway)\b(?:\s*(?:,|#|suite|ste)\s*[A-Za-z0-9.\- ]{0,30})?/i
-  );
-  return match ? match[0].trim() : null;
+  return extractStreetAddressStrict(text);
 }
 
 
@@ -867,9 +860,9 @@ async function geoapifyExplicitAddress(job, address, providerLabel) {
   const url = new URL("https://api.geoapify.com/v1/geocode/search");
   url.searchParams.set("text", address);
   url.searchParams.set("filter", "countrycode:us");
-  if (validCoordinate(job?.latitude, job?.longitude)) {
-    url.searchParams.set("bias", `proximity:${job.longitude},${job.latitude}`);
-  }
+  // A complete street address must stand on its own. Do not bias an exact-address
+  // geocode toward a provider centroid because that can pull SE/SW or NE/NW streets
+  // to the wrong side of a city.
   url.searchParams.set("format", "json");
   url.searchParams.set("limit", "3");
   url.searchParams.set("lang", "en");
@@ -882,6 +875,7 @@ async function geoapifyExplicitAddress(job, address, providerLabel) {
     for (const result of results) {
       const lat = Number(result.lat), lon = Number(result.lon);
       if (!validCoordinate(lat, lon)) continue;
+      if (!geocoderResultMatchesAddress(address, result)) continue;
       // An address explicitly supplied by the posting is stronger than an approximate
       // provider pin. Still reject absurd geocodes far away from the provider area.
       if (validCoordinate(job?.latitude, job?.longitude)) {
@@ -973,9 +967,8 @@ async function geoapifyAddressCandidate(job) {
   const url = new URL("https://api.geoapify.com/v1/geocode/search");
   url.searchParams.set("text", `${address}, ${job.location || ""}`.trim());
   url.searchParams.set("filter", "countrycode:us");
-  if (validCoordinate(job.latitude, job.longitude)) {
-    url.searchParams.set("bias", `proximity:${job.longitude},${job.latitude}`);
-  }
+  // Do not let an approximate provider pin bias a street-address lookup onto a
+  // different directional street segment. The returned address is validated below.
   url.searchParams.set("format", "json");
   url.searchParams.set("limit", "3");
   url.searchParams.set("lang", "en");
@@ -991,6 +984,7 @@ async function geoapifyAddressCandidate(job) {
       const lat = Number(result.lat);
       const lon = Number(result.lon);
       if (!validCoordinate(lat, lon)) continue;
+      if (!geocoderResultMatchesAddress(`${address}, ${job.location || ""}`, result)) continue;
 
       if (validCoordinate(job.latitude, job.longitude)) {
         const miles = milesBetween(job.latitude, job.longitude, lat, lon);
@@ -1141,7 +1135,7 @@ function workplaceCacheKey(job) {
   // reusing the wrong branch for 90 days.
   const anchor = validCoordinate(job.latitude, job.longitude)
     ? `${Number(job.latitude).toFixed(2)},${Number(job.longitude).toFixed(2)}` : "no-anchor";
-  return `${company}|${location}|${anchor}`;
+  return `${WORKPLACE_CACHE_VERSION}|${company}|${location}|${anchor}`;
 }
 
 async function getCachedWorkplaceCore(job) {
@@ -2010,13 +2004,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.51" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.52" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.51",
+        version: "9.4.52",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -2062,18 +2056,18 @@ const server = http.createServer(async (req, res) => {
 });
 
 hydrateGeoCacheFromFirestore().catch((error) => {
-  console.error("GeoCache V2 startup hydration failed:", error.message);
+  console.error("GeoCache V3 startup hydration failed:", error.message);
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.51 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.52 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
   console.log("The Muse:", THE_MUSE_API_KEY ? "enabled" : "disabled");
   console.log("ATS feeds:", `${getAtsBoards().length} employer boards configured`);
   console.log("Fast search cache: enabled");
-  console.log("GeoCache V2: normalized LRU, short negative TTL, request dedupe, persistent job-location cache");
+  console.log("GeoCache V3: directional-address integrity, normalized LRU, request dedupe, persistent job-location cache");
   console.log("Firestore workplace cache:", firestoreEnabled ? "enabled" : "disabled");
   console.log("Firestore cache policy: high-confidence-only");
   console.log("Posting address lookup: enabled");
