@@ -1,7 +1,7 @@
 name: Validate JobBubble backend
 # Production server.js may be fully materialized with the current GeoCache runtime.
-# Keep this verifier version-aware so an intentional cache-schema bump is validated
-# rather than mistaken for an unmaterialized bootstrap source.
+# Keep this verifier version-aware so intentional cache and backend-version bumps are
+# validated rather than mistaken for an unmaterialized bootstrap source.
 
 on:
   push:
@@ -62,7 +62,7 @@ jobs:
             grep -Fq 'geo_cache_version: GEO_CACHE_VERSION' server.js
             if grep -Fq 'const GEO_CACHE_VERSION = "v3";' server.js; then
               grep -Fq 'geocoderResultMatchesAddress' server.js
-              grep -Fq 'const WORKPLACE_CACHE_VERSION = "v2";' server.js
+              grep -Eq 'const WORKPLACE_CACHE_VERSION = "v[0-9]+";' server.js
               grep -Fq 'extractStreetAddressStrict(text)' server.js
             fi
           else
@@ -168,6 +168,8 @@ jobs:
           const root = JSON.parse(fs.readFileSync('/tmp/root.json', 'utf8'));
           const health = JSON.parse(fs.readFileSync('/tmp/health.json', 'utf8'));
           if (!root.version || typeof root.version !== 'string') throw new Error('root response missing version');
+          if (!health.version || typeof health.version !== 'string') throw new Error('health response missing version');
+          if (root.version !== health.version) throw new Error(`root/health version mismatch: ${root.version} vs ${health.version}`);
           if (health.status !== 'ok') throw new Error(`health status is ${health.status}`);
           if (!/^v\d+$/.test(String(health.geo_cache_version || ''))) throw new Error('health missing valid geo cache version');
           console.log(`Backend HTTP smoke version ${root.version}; GeoCache ${health.geo_cache_version}`);
@@ -178,7 +180,6 @@ jobs:
 
           if grep -Fq 'const GEO_CACHE_VERSION = "v3";' server.js; then
             grep -q '"geo_cache_version":"v3"' /tmp/health.json
-            grep -q '"version":"9.4.52"' /tmp/health.json
           fi
 
           curl -fsS --max-time 90 \
