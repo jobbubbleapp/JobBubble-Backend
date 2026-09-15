@@ -46,7 +46,7 @@ const BUG_REPORT_WINDOW_MS = 10 * 60 * 1000;
 const BUG_REPORT_MAX_PER_WINDOW = 5;
 const { fetchMuseJobs, normalizeMuseJob } = require("./providers/themuse");
 const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");
-const { extractStreetAddress: extractStreetAddressStrict, geocoderResultMatchesAddress } = require("./location-integrity");
+const { extractStreetAddress: extractStreetAddressStrict, extractContextualStreetAddress, geocoderResultMatchesAddress, canRefineAreaToStreet } = require("./location-integrity");
 
 // GeoCache V2: successful job-location geocodes are stable and can live much
 // longer, while weak/failed matches expire quickly so temporary misses do not poison
@@ -273,7 +273,7 @@ const POSTING_PAGE_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // it can use a much longer lifetime.
 const workplaceCache = new Map();
 const WORKPLACE_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
-const WORKPLACE_CACHE_VERSION = "v2";
+const WORKPLACE_CACHE_VERSION = "v3";
 // Medium-confidence matches may help during the current server session, but expire
 // quickly and are never persisted to Firestore.
 const MEDIUM_WORKPLACE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -833,6 +833,15 @@ async function postingPageStreetAddressCore(job) {
         }
       } catch (_) {}
     }
+
+    // Some providers (including The Muse) expose the true workplace address in the
+    // visible job body instead of JobPosting JSON-LD. Only accept a visible address
+    // when it is tied to explicit workplace/location context for this posting.
+    const contextualAddress = extractContextualStreetAddress(html, job?.location || "");
+    if (contextualAddress) {
+      postingPageCache.set(cacheKey, { time: Date.now(), value: contextualAddress });
+      return contextualAddress;
+    }
   } catch (error) {
     console.error("Posting-page address lookup failed:", error.message);
   }
@@ -1032,6 +1041,12 @@ function locationContextScore(jobLocation, result) {
 async function geoapifyLikelyWorkplace(job) {
   if (!GEOAPIFY_API_KEY || !job || looksLikeStreetAddress(job.location) ||
       isGenericCompanyName(job.company)) return null;
+
+  // Never turn a city/area centroid into a street-level branch merely by searching
+  // for the employer name. Chains can have many branches in one city; choosing the
+  // closest one to a city centroid creates convincing but false pins. Exact posting
+  // evidence is handled earlier. Without it, keep the honest area estimate.
+  if (!canRefineAreaToStreet(job)) return null;
 
   // Include the provider's approximate coordinate in the lookup cache. This keeps
   // separate branches of the same chain in the same city from sharing one result.
@@ -2004,13 +2019,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/") {
-      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.52" });
+      return sendJson(res, 200, { name: "JobBubble API", status: "online", version: "9.4.53" });
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
       return sendJson(res, 200, {
         status: "ok",
-        version: "9.4.52",
+        version: "9.4.53",
         adzuna: ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled",
         geoapify: GEOAPIFY_API_KEY ? "enabled" : "disabled",
         usajobs: USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled",
@@ -2060,7 +2075,7 @@ hydrateGeoCacheFromFirestore().catch((error) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`JobBubble backend V9.4.52 listening on port ${PORT}`);
+  console.log(`JobBubble backend V9.4.53 listening on port ${PORT}`);
   console.log("Adzuna:", ADZUNA_APP_ID && ADZUNA_APP_KEY ? "enabled" : "disabled");
   console.log("Geoapify:", GEOAPIFY_API_KEY ? "enabled" : "disabled");
   console.log("USAJOBS:", USAJOBS_API_KEY && USAJOBS_EMAIL ? "enabled" : "disabled");
