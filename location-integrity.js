@@ -44,7 +44,6 @@ function normalizeWords(value) {
     .replace(/[^a-z0-9#\-, ]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  // Longest directional forms first so "south east" is not partially rewritten.
   const replacements = Array.from(DIRECTION_WORDS.entries())
     .filter(([from]) => from.length > 2)
     .sort((a,b) => b[0].length - a[0].length);
@@ -61,11 +60,13 @@ function extractStreetAddress(text) {
     .replace(/&amp;/gi, '&'));
   if (!plain) return null;
 
-  const dir = '(?:N|S|E|W|NE|NW|SE|SW|North|South|East|West|Northeast|Northwest|Southeast|Southwest|North\\s+East|North\\s+West|South\\s+East|South\\s+West)';
+  // Put compound directions before their single-letter prefixes. Otherwise a regex
+  // engine can match the S in SE (or N in NW) and silently drop the second letter.
+  const dir = '(?:NE|NW|SE|SW|N|S|E|W|Northeast|Northwest|Southeast|Southwest|North\\s+East|North\\s+West|South\\s+East|South\\s+West|North|South|East|West)';
   const type = '(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|cir|circle|ter|terrace)';
   const rx = new RegExp(
     '\\b\\d{1,6}[A-Za-z]?\\s+(?:' + dir + '\\s+)?[A-Za-z0-9.\'#&\\- ]{1,55}?\\s' +
-    type + '\\b(?:\\s+' + dir + ')?(?:\\s*(?:,|#|suite|ste|unit)\\s*[A-Za-z0-9.\\- ]{0,30})?',
+    type + '\\b(?:\\s+' + dir + ')?(?:\\s*(?:#|suite|ste|unit)\\s*[A-Za-z0-9.\\- ]{1,30})?',
     'i'
   );
   const match = plain.match(rx);
