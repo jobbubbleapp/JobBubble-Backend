@@ -29,6 +29,10 @@ const STATE_NAMES = new Map([
   ['district of columbia','DC']
 ]);
 
+const DIR_PATTERN = '(?:NE|NW|SE|SW|N|S|E|W|Northeast|Northwest|Southeast|Southwest|North\\s+East|North\\s+West|South\\s+East|South\\s+West|North|South|East|West)';
+const TYPE_PATTERN = '(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|cir|circle|ter|terrace)';
+const STREET_PATTERN = '\\b\\d{1,6}[A-Za-z]?\\s+(?:' + DIR_PATTERN + '\\s+)?[A-Za-z0-9.\'#&\\- ]{1,55}?\\s' + TYPE_PATTERN + '\\b(?:\\s+' + DIR_PATTERN + ')?(?:\\s*(?:#|suite|ste|unit)\\s*[A-Za-z0-9.\\- ]{1,30})?';
+
 function cleanText(value) {
   return String(value == null ? '' : value)
     .normalize('NFKD')
@@ -53,24 +57,73 @@ function normalizeWords(value) {
   return out.replace(/\s+/g, ' ').trim();
 }
 
-function extractStreetAddress(text) {
-  const plain = cleanText(String(text || '')
+function visibleText(value) {
+  return cleanText(String(value || '')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&'));
-  if (!plain) return null;
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;|&#34;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'"));
+}
 
-  // Put compound directions before their single-letter prefixes. Otherwise a regex
-  // engine can match the S in SE (or N in NW) and silently drop the second letter.
-  const dir = '(?:NE|NW|SE|SW|N|S|E|W|Northeast|Northwest|Southeast|Southwest|North\\s+East|North\\s+West|South\\s+East|South\\s+West|North|South|East|West)';
-  const type = '(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|cir|circle|ter|terrace)';
-  const rx = new RegExp(
-    '\\b\\d{1,6}[A-Za-z]?\\s+(?:' + dir + '\\s+)?[A-Za-z0-9.\'#&\\- ]{1,55}?\\s' +
-    type + '\\b(?:\\s+' + dir + ')?(?:\\s*(?:#|suite|ste|unit)\\s*[A-Za-z0-9.\\- ]{1,30})?',
-    'i'
-  );
-  const match = plain.match(rx);
+function extractStreetAddress(text) {
+  const plain = visibleText(text);
+  if (!plain) return null;
+  const match = plain.match(new RegExp(STREET_PATTERN, 'i'));
   return match ? match[0].trim() : null;
+}
+
+function extractStreetAddressMatches(text) {
+  const plain = visibleText(text);
+  const rx = new RegExp(STREET_PATTERN, 'ig');
+  const matches = [];
+  let match;
+  while ((match = rx.exec(plain)) && matches.length < 40) {
+    matches.push({ address: match[0].trim(), index: match.index, plain });
+    if (match.index === rx.lastIndex) rx.lastIndex++;
+  }
+  return matches;
+}
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractContextualStreetAddress(pageText, jobLocation) {
+  const matches = extractStreetAddressMatches(pageText);
+  if (!matches.length) return null;
+
+  const pieces = cleanText(jobLocation).split(',').map((x) => x.trim()).filter(Boolean);
+  const city = pieces[0] || '';
+  const state = requestedState(jobLocation) || (pieces[1] && /^[A-Za-z]{2}$/.test(pieces[1]) ? pieces[1].toUpperCase() : '');
+  const cityRx = city ? new RegExp('\\b' + escapeRegex(city) + '\\b', 'i') : null;
+  const stateRx = state ? new RegExp('\\b' + escapeRegex(state) + '\\b', 'i') : null;
+
+  let best = null;
+  for (const match of matches) {
+    const start = Math.max(0, match.index - 240);
+    const end = Math.min(match.plain.length, match.index + match.address.length + 180);
+    const context = match.plain.slice(start, end);
+    const hasCity = !cityRx || cityRx.test(context);
+    const hasState = !stateRx || stateRx.test(context);
+    if (!hasCity || !hasState) continue;
+
+    let score = 0;
+    if (cityRx && cityRx.test(context)) score += 30;
+    if (stateRx && stateRx.test(context)) score += 20;
+    if (/\b(?:work\s*location|worksite|job\s*location|site\s*address|office\s*address|financial\s*center|pay\s*transparency|client-provided\s*location)\b/i.test(context)) score += 35;
+    if (city && state) {
+      const museMarker = new RegExp('\\bUS\\s*-\\s*' + escapeRegex(state) + '\\s*-\\s*' + escapeRegex(city) + '\\s*-', 'i');
+      if (museMarker.test(context)) score += 60;
+    }
+    if (!best || score > best.score) best = { address: match.address, score };
+  }
+
+  // Do not promote an arbitrary footer/contact address. Visible-page fallback is
+  // accepted only when the address is tied to explicit workplace/location context.
+  return best && best.score >= 65 ? best.address : null;
 }
 
 function directionToken(token) {
@@ -141,17 +194,12 @@ function geocoderResultMatchesAddress(address, result) {
   const want = streetSignature(address);
   const got = streetSignature(resultStreetText(result));
   if (!want || !got) return false;
-
   if (want.house !== got.house) return false;
   if (want.type !== got.type) return false;
 
   const wantedName = new Set(want.name);
   const gotName = new Set(got.name);
   if (!wantedName.size || Array.from(wantedName).some((token) => !gotName.has(token))) return false;
-
-  // Directionals are identity-bearing parts of many US street names. Never accept
-  // SE as SW, N as S, etc. If the provider omitted a directional but the geocoder
-  // had to add one, the address is ambiguous and must remain approximate.
   if (!sameTokenSet(want.dirs, got.dirs)) return false;
 
   const wantState = requestedState(address);
@@ -161,13 +209,22 @@ function geocoderResultMatchesAddress(address, result) {
   const wantZip = requestedPostcode(address);
   const gotZip = String(result?.postcode || '').match(/^\d{5}/)?.[0] || requestedPostcode(result?.formatted || '');
   if (wantZip && gotZip && wantZip !== gotZip) return false;
+  return true;
+}
 
+function canRefineAreaToStreet(job) {
+  const precision = String(job?.location_precision || '').toLowerCase();
+  const provider = String(job?.location_match_provider || '').toLowerCase();
+  if (!precision || precision === 'area') return false;
+  if (/search area|area estimate|geoapify area/.test(provider)) return false;
   return true;
 }
 
 module.exports = {
   extractStreetAddress,
+  extractContextualStreetAddress,
   geocoderResultMatchesAddress,
   streetSignature,
-  resultStreetText
+  resultStreetText,
+  canRefineAreaToStreet
 };
