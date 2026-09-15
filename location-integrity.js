@@ -2,7 +2,7 @@
 
 const STREET_TYPES = new Map([
   ['st','st'],['street','st'],['ave','ave'],['avenue','ave'],['rd','rd'],['road','rd'],
-  ['blvd','blvd'],['boulevard','blvd'],['dr','dr'],['drive','dr'],['ln','ln'],['lane','ln'],
+  ['blvd','blvd'],['boulevard','blvd'],['dr','dr'],['drive','dr'],['ln','ln'],['lane','lane'],
   ['way','way'],['ct','ct'],['court','ct'],['pl','pl'],['place','pl'],['pkwy','pkwy'],
   ['parkway','pkwy'],['hwy','hwy'],['highway','hwy'],['cir','cir'],['circle','cir'],
   ['ter','ter'],['terrace','ter']
@@ -29,7 +29,9 @@ const STATE_NAMES = new Map([
   ['district of columbia','DC']
 ]);
 
-const DIR_PATTERN = '(?:NE|NW|SE|SW|N|S|E|W|Northeast|Northwest|Southeast|Southwest|North\\s+East|North\\s+West|South\\s+East|South\\s+West|North|South|East|West)';
+// Longest alternatives first. This prevents "Southeast" from being accepted as just
+// "S" and prevents "SW" from being accepted as just "S".
+const DIR_PATTERN = '(?:North\\s+East|North\\s+West|South\\s+East|South\\s+West|Northeast|Northwest|Southeast|Southwest|NE|NW|SE|SW|North|South|East|West|N|S|E|W)';
 const TYPE_PATTERN = '(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway|cir|circle|ter|terrace)';
 const STREET_PATTERN = '\\b\\d{1,6}[A-Za-z]?\\s+(?:' + DIR_PATTERN + '\\s+)?[A-Za-z0-9.\'#&\\- ]{1,55}?\\s' + TYPE_PATTERN + '\\b(?:\\s+' + DIR_PATTERN + ')?(?:\\s*(?:#|suite|ste|unit)\\s*[A-Za-z0-9.\\- ]{1,30})?';
 
