@@ -1,0 +1,71 @@
+name: Verify V9.4.52 production location integrity
+
+on:
+  push:
+    branches:
+      - verify/v952-live-location
+    paths:
+      - '.github/workflows/verify-v952-production-location.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify production health and Senior Banker location
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE='https://jobbubble-backend-1.onrender.com'
+          curl -fsS --retry 5 --retry-delay 2 "$BASE/health" >/tmp/health.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const h=JSON.parse(fs.readFileSync('/tmp/health.json','utf8'));
+          if(h.status!=='ok') throw new Error('production health not ok');
+          if(h.version!=='9.4.52') throw new Error(`expected V9.4.52, got ${h.version}`);
+          if(h.geo_cache_version!=='v3') throw new Error(`expected GeoCache v3, got ${h.geo_cache_version}`);
+          console.log('Production health verified:', JSON.stringify({version:h.version,geo_cache_version:h.geo_cache_version}));
+          NODE
+
+          curl -fsS --retry 3 --retry-delay 2 --max-time 120 \
+            "$BASE/jobs?where=Everett%2C%20WA&radius=50&source=themuse&what=Senior%20Banker&refresh=1&refined=1" \
+            >/tmp/muse.json
+          curl -fsS --retry 3 --retry-delay 2 --max-time 120 \
+            "$BASE/jobs?where=Everett%2C%20WA&radius=50&source=all&what=banker&refresh=1&refined=1" \
+            >/tmp/all.json
+
+          node - <<'NODE'
+          const fs=require('fs');
+          const payloads=['/tmp/muse.json','/tmp/all.json'].map(p=>JSON.parse(fs.readFileSync(p,'utf8')));
+          const jobs=payloads.flatMap(p=>Array.isArray(p.jobs)?p.jobs:[]);
+          const seen=new Set();
+          const matches=[];
+          for(const j of jobs){
+            const key=[j.id,j.source,j.title].join('|');
+            if(seen.has(key)) continue;
+            seen.add(key);
+            if(/senior\s+banker/i.test(String(j.title||''))) matches.push(j);
+          }
+          console.log(`Live Senior Banker matches: ${matches.length}`);
+          for(const j of matches){
+            console.log(JSON.stringify({
+              title:j.title, company:j.company, source:j.source, location:j.location,
+              latitude:j.latitude, longitude:j.longitude, location_precision:j.location_precision,
+              location_approximate:j.location_approximate, location_confidence:j.location_confidence,
+              location_match_provider:j.location_match_provider, distance_miles:j.distance_miles
+            }));
+            const loc=String(j.location||'');
+            if(/112th\s+(?:st|street)\s+sw\b/i.test(loc)) {
+              throw new Error(`Senior Banker still resolved to wrong SW street: ${loc}`);
+            }
+            if(j.location_precision==='exact' && /112th\s+(?:st|street)/i.test(loc) && !/\b(?:se|southeast|south\s+east)\b/i.test(loc)) {
+              throw new Error(`Exact 112th Street result lost SE directional: ${loc}`);
+            }
+          }
+          if(!matches.length) console.log('Posting not returned by providers in this live query; production health/cache-version checks still passed.');
+          NODE
