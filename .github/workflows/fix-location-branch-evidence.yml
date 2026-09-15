@@ -1,0 +1,58 @@
+name: Verify V9.4.53 location branch evidence
+
+on:
+  push:
+    branches:
+      - fix/location-branch-evidence-v953
+    paths:
+      - 'location-integrity.js'
+      - 'test/location-integrity.test.js'
+      - 'scripts/fix-location-branch-evidence.js'
+      - '.github/workflows/fix-location-branch-evidence.yml'
+      - '.github/workflows/validate-backend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Verify location helpers and regression tests
+        run: |
+          set -euo pipefail
+          node --check location-integrity.js
+          node --check test/location-integrity.test.js
+          npm test
+      - name: Materialize V9.4.53 server fix
+        run: |
+          set -euo pipefail
+          node scripts/fix-location-branch-evidence.js
+          node --check server.js
+          grep -Fq 'version: "9.4.53"' server.js
+          grep -Fq 'const GEO_CACHE_VERSION = "v3";' server.js
+          grep -Fq 'const WORKPLACE_CACHE_VERSION = "v3";' server.js
+          grep -Fq 'extractContextualStreetAddress(html, job?.location || "")' server.js
+          grep -Fq 'if (!canRefineAreaToStreet(job)) return null;' server.js
+          npm test
+      - name: Commit materialized server
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- server.js; then
+            echo 'server.js already materialized'
+            exit 0
+          fi
+          git config user.name 'jobbubbleapp'
+          git config user.email 'jobbubbleapp@gmail.com'
+          git add server.js
+          git commit -m 'Materialize V9.4.53 posting-evidence location hardening'
+          git push origin HEAD:fix/location-branch-evidence-v953
