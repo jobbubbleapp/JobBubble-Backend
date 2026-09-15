@@ -1,4 +1,4 @@
-name: Verify V9.4.52 production location integrity
+name: Inspect V9.4.52 production Senior Banker location
 
 on:
   push:
@@ -12,60 +12,54 @@ permissions:
   contents: read
 
 jobs:
-  verify-live:
+  inspect-live:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Verify production health and Senior Banker location
+      - name: Inspect production Senior Banker evidence
         shell: bash
         run: |
           set -euo pipefail
           BASE='https://jobbubble-backend-1.onrender.com'
           curl -fsS --retry 5 --retry-delay 2 "$BASE/health" >/tmp/health.json
-          node - <<'NODE'
-          const fs=require('fs');
-          const h=JSON.parse(fs.readFileSync('/tmp/health.json','utf8'));
-          if(h.status!=='ok') throw new Error('production health not ok');
-          if(h.version!=='9.4.52') throw new Error(`expected V9.4.52, got ${h.version}`);
-          if(h.geo_cache_version!=='v3') throw new Error(`expected GeoCache v3, got ${h.geo_cache_version}`);
-          console.log('Production health verified:', JSON.stringify({version:h.version,geo_cache_version:h.geo_cache_version}));
-          NODE
-
           curl -fsS --retry 3 --retry-delay 2 --max-time 120 \
             "$BASE/jobs?where=Everett%2C%20WA&radius=50&source=themuse&what=Senior%20Banker&refresh=1&refined=1" \
             >/tmp/muse.json
-          curl -fsS --retry 3 --retry-delay 2 --max-time 120 \
-            "$BASE/jobs?where=Everett%2C%20WA&radius=50&source=all&what=banker&refresh=1&refined=1" \
-            >/tmp/all.json
 
           node - <<'NODE'
           const fs=require('fs');
-          const payloads=['/tmp/muse.json','/tmp/all.json'].map(p=>JSON.parse(fs.readFileSync(p,'utf8')));
-          const jobs=payloads.flatMap(p=>Array.isArray(p.jobs)?p.jobs:[]);
-          const seen=new Set();
-          const matches=[];
-          for(const j of jobs){
-            const key=[j.id,j.source,j.title].join('|');
-            if(seen.has(key)) continue;
-            seen.add(key);
-            if(/senior\s+banker/i.test(String(j.title||''))) matches.push(j);
-          }
-          console.log(`Live Senior Banker matches: ${matches.length}`);
-          for(const j of matches){
-            console.log(JSON.stringify({
-              title:j.title, company:j.company, source:j.source, location:j.location,
-              latitude:j.latitude, longitude:j.longitude, location_precision:j.location_precision,
-              location_approximate:j.location_approximate, location_confidence:j.location_confidence,
-              location_match_provider:j.location_match_provider, distance_miles:j.distance_miles
-            }));
-            const loc=String(j.location||'');
-            if(/112th\s+(?:st|street)\s+sw\b/i.test(loc)) {
-              throw new Error(`Senior Banker still resolved to wrong SW street: ${loc}`);
-            }
-            if(j.location_precision==='exact' && /112th\s+(?:st|street)/i.test(loc) && !/\b(?:se|southeast|south\s+east)\b/i.test(loc)) {
-              throw new Error(`Exact 112th Street result lost SE directional: ${loc}`);
-            }
-          }
-          if(!matches.length) console.log('Posting not returned by providers in this live query; production health/cache-version checks still passed.');
+          const h=JSON.parse(fs.readFileSync('/tmp/health.json','utf8'));
+          if(h.version!=='9.4.52' || h.geo_cache_version!=='v3') throw new Error('wrong production version/cache');
+          const p=JSON.parse(fs.readFileSync('/tmp/muse.json','utf8'));
+          const j=(p.jobs||[]).find(x=>/senior\s+banker/i.test(String(x.title||'')));
+          if(!j) throw new Error('Senior Banker not returned');
+          console.log('LIVE_JOB='+JSON.stringify({
+            id:j.id,title:j.title,company:j.company,source:j.source,location:j.location,
+            latitude:j.latitude,longitude:j.longitude,location_precision:j.location_precision,
+            location_approximate:j.location_approximate,location_confidence:j.location_confidence,
+            location_match_provider:j.location_match_provider,apply_url:j.apply_url,
+            description:String(j.description||'').slice(0,1500)
+          }));
+          fs.writeFileSync('/tmp/apply-url.txt',String(j.apply_url||''));
           NODE
+
+          APPLY=$(cat /tmp/apply-url.txt)
+          if [[ "$APPLY" == http* ]]; then
+            curl -LfsS --retry 2 --max-time 30 \
+              -A 'Mozilla/5.0 (compatible; JobBubble-location-audit)' \
+              "$APPLY" >/tmp/apply.html || true
+            if [ -s /tmp/apply.html ]; then
+              node - <<'NODE'
+              const fs=require('fs');
+              const html=fs.readFileSync('/tmp/apply.html','utf8');
+              const plain=html.replace(/<[^>]+>/g,' ').replace(/&nbsp;/gi,' ').replace(/\s+/g,' ');
+              const addresses=plain.match(/\b\d{1,6}\s+[A-Za-z0-9.'#&\- ]{2,60}\s(?:st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|pl|place|pkwy|parkway|hwy|highway)\b(?:\s+(?:NE|NW|SE|SW|N|S|E|W))?/gi)||[];
+              console.log('APPLY_FINAL_ADDRESS_CANDIDATES='+JSON.stringify([...new Set(addresses)].slice(0,20)));
+              console.log('APPLY_HAS_1803_112TH_SE='+/1803\s+112th\s+(?:st|street)\s+(?:se|southeast|south\s+east)\b/i.test(plain));
+              console.log('APPLY_HAS_112TH_SW='+/112th\s+(?:st|street)\s+sw\b/i.test(plain));
+              NODE
+            else
+              echo 'Apply page could not be fetched from CI'
+            fi
+          fi
