@@ -13,6 +13,18 @@ function replaceOnce(oldText, newText, label) {
   text = text.replace(oldText, newText);
 }
 
+function replaceInSection(startMarker, endMarker, oldText, newText, label) {
+  const start = text.indexOf(startMarker);
+  if (start < 0) throw new Error(`${label}: section start missing`);
+  const end = text.indexOf(endMarker, start + startMarker.length);
+  if (end < 0) throw new Error(`${label}: section end missing`);
+  let section = text.slice(start, end);
+  const count = section.split(oldText).length - 1;
+  if (count !== 1) throw new Error(`${label}: expected 1 section match, found ${count}`);
+  section = section.replace(oldText, newText);
+  text = text.slice(0, start) + section + text.slice(end);
+}
+
 replaceOnce(
   'const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");',
   'const { fetchAtsJobs, getAtsBoards } = require("./providers/ats");\nconst { extractStreetAddress: extractStreetAddressStrict, geocoderResultMatchesAddress } = require("./location-integrity");',
@@ -64,7 +76,9 @@ replaceOnce(
   'validate explicit geocoder result'
 );
 
-replaceOnce(
+replaceInSection(
+  'async function geoapifyAddressCandidate(job) {',
+  'function locationContextTokens(value) {',
   `  if (validCoordinate(job.latitude, job.longitude)) {
     url.searchParams.set("bias", \`proximity:\${job.longitude},\${job.latitude}\`);
   }
@@ -73,7 +87,9 @@ replaceOnce(
   'remove description-address proximity bias'
 );
 
-replaceOnce(
+replaceInSection(
+  'async function geoapifyAddressCandidate(job) {',
+  'function locationContextTokens(value) {',
   `      const lat = Number(result.lat);
       const lon = Number(result.lon);
       if (!validCoordinate(lat, lon)) continue;
