@@ -22,8 +22,8 @@ jobs:
         run: |
           set -euo pipefail
           BASE='https://jobbubble-backend-1.onrender.com'
-          curl -fsS --retry 5 --retry-delay 2 "$BASE/health" >/tmp/health.json
-          curl -fsS --retry 3 --retry-delay 2 --max-time 120 \
+          curl -fsS --retry 8 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 60 "$BASE/health" >/tmp/health.json
+          curl -fsS --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 150 \
             "$BASE/jobs?where=Everett%2C%20WA&radius=50&source=themuse&what=Senior%20Banker&refresh=1&refined=1" \
             >/tmp/muse.json
 
@@ -46,7 +46,7 @@ jobs:
 
           APPLY=$(cat /tmp/apply-url.txt)
           if [[ "$APPLY" == http* ]]; then
-            curl -LfsS --retry 2 --max-time 30 \
+            curl -LfsS --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 60 \
               -A 'Mozilla/5.0 (compatible; JobBubble-location-audit)' \
               "$APPLY" >/tmp/apply.html || true
             if [ -s /tmp/apply.html ]; then
