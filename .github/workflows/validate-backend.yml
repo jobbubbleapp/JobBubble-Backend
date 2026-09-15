@@ -1,5 +1,7 @@
 name: Validate JobBubble backend
-# Production server.js is materialized with GeoCache V2 and fast first-response logic.
+# Production server.js may be fully materialized with the current GeoCache runtime.
+# Keep this verifier version-aware so an intentional cache-schema bump is validated
+# rather than mistaken for an unmaterialized bootstrap source.
 
 on:
   push:
@@ -10,6 +12,8 @@ on:
       - '.github/workflows/validate-backend.yml'
       - 'providers/**'
       - 'server.js'
+      - 'location-integrity.js'
+      - 'test/**'
       - 'bootstrap.js'
       - 'bootstrap-fast.js'
       - 'render-preload.js'
@@ -20,6 +24,8 @@ on:
     paths:
       - 'providers/**'
       - 'server.js'
+      - 'location-integrity.js'
+      - 'test/**'
       - 'bootstrap.js'
       - 'bootstrap-fast.js'
       - 'render-preload.js'
@@ -39,26 +45,36 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Validate syntax and GeoCache V2 runtime
+      - name: Validate syntax and materialized GeoCache runtime
         run: |
           set -euo pipefail
           node --check server.js
           node --check providers/ats.js
           node --check providers/themuse.js
-          if grep -Fq 'const GEO_CACHE_VERSION = "v2";' server.js; then
-            echo 'Validating materialized GeoCache V2 runtime'
+          if [ -f location-integrity.js ]; then node --check location-integrity.js; fi
+
+          if grep -Fq 'const geoCache = new SmartGeoCache();' server.js; then
+            echo 'Validating materialized GeoCache runtime'
+            grep -Eq 'const GEO_CACHE_VERSION = "v[0-9]+";' server.js
             grep -Fq 'const geoCache = new SmartGeoCache();' server.js
             grep -Fq 'setTimeout(resolve, 900)' server.js
             grep -Fq 'Promise.allSettled([' server.js
             grep -Fq 'geo_cache_version: GEO_CACHE_VERSION' server.js
+            if grep -Fq 'const GEO_CACHE_VERSION = "v3";' server.js; then
+              grep -Fq 'geocoderResultMatchesAddress' server.js
+              grep -Fq 'const WORKPLACE_CACHE_VERSION = "v2";' server.js
+              grep -Fq 'extractStreetAddressStrict(text)' server.js
+            fi
           else
-            echo 'Validating bootstrap-generated GeoCache V2 runtime'
+            echo 'Validating bootstrap-generated GeoCache runtime'
             node --check bootstrap.js
             node --check bootstrap-fast.js
             node --check render-preload.js
             node --check materialize-runtime.js
             node bootstrap-fast.js --check
           fi
+      - name: Run backend unit tests
+        run: npm test
       - name: Fetch and validate live public ATS jobs
         run: |
           node - <<'NODE'
@@ -111,7 +127,8 @@ jobs:
           if grep -Fq 'Math.min(requestedRadius, 100)' server.js; then echo 'Old request radius cap returned'; exit 1; fi
           if grep -Fq 'Math.min(radius, 100)' server.js; then echo 'Old provider radius cap returned'; exit 1; fi
 
-          if grep -Fq 'const GEO_CACHE_VERSION = "v2";' server.js; then
+          if grep -Fq 'const geoCache = new SmartGeoCache();' server.js; then
+            grep -Eq 'GEO_CACHE_VERSION = "v[0-9]+"' server.js
             grep -q 'GEO_NEGATIVE_CACHE_TTL_MS = 30 \* 60 \* 1000' server.js
             grep -q 'class SmartGeoCache extends Map' server.js
             grep -q 'hydrateGeoCacheFromFirestore' server.js
@@ -133,7 +150,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if grep -Fq 'const GEO_CACHE_VERSION = "v2";' server.js; then
+          if grep -Fq 'const geoCache = new SmartGeoCache();' server.js; then
             PORT=3100 node server.js >/tmp/jobbubble-server.log 2>&1 &
           else
             PORT=3100 NODE_OPTIONS='--require ./render-preload.js' node server.js >/tmp/jobbubble-server.log 2>&1 &
@@ -152,12 +169,17 @@ jobs:
           const health = JSON.parse(fs.readFileSync('/tmp/health.json', 'utf8'));
           if (!root.version || typeof root.version !== 'string') throw new Error('root response missing version');
           if (health.status !== 'ok') throw new Error(`health status is ${health.status}`);
-          console.log(`Backend HTTP smoke version ${root.version}`);
+          if (!/^v\d+$/.test(String(health.geo_cache_version || ''))) throw new Error('health missing valid geo cache version');
+          console.log(`Backend HTTP smoke version ${root.version}; GeoCache ${health.geo_cache_version}`);
           NODE
           grep -q '"ats":"enabled"' /tmp/health.json
-          grep -q '"geo_cache_version":"v2"' /tmp/health.json
           grep -q '"firestore_geo_cache":"disabled"' /tmp/health.json
-          grep -q 'GeoCache V2:' /tmp/jobbubble-server.log
+          grep -Eq 'GeoCache V[0-9]+:' /tmp/jobbubble-server.log
+
+          if grep -Fq 'const GEO_CACHE_VERSION = "v3";' server.js; then
+            grep -q '"geo_cache_version":"v3"' /tmp/health.json
+            grep -q '"version":"9.4.52"' /tmp/health.json
+          fi
 
           curl -fsS --max-time 90 \
             'http://127.0.0.1:3100/jobs?where=Everett%2C%20WA&lat=47.9780&lon=-122.2021&radius=250&source=ats&what=warehouse&refresh=1' \
